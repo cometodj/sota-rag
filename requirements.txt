@@ -1,0 +1,9 @@
+pymupdf
+chromadb
+sentence-transformers
+ollama
+pyyaml
+pandas
+tqdm
+rich
+scikit-learn

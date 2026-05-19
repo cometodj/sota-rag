@@ -1,0 +1,30 @@
+project:
+  name: "SOTA RAG"
+  description: "Agentic RAG Evaluator for Technical Documents"
+
+paths:
+  data_dir: "data"
+  output_dir: "outputs"
+  benchmark_questions: "benchmark/benchmark_questions.jsonl"
+  vector_db_dir: "outputs/chroma_db"
+
+document:
+  pdf_path: "data/NVM-Express-1_4c-2021.06.28-Ratified.pdf"
+
+chunking:
+  chunk_size: 800
+  chunk_overlap: 150
+
+embedding:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  collection_name: "sample_doc_all_minilm_l6_v2"
+
+ollama:
+  model_name: "qwen2.5:14b"
+  temperature: 0.1
+
+retrieval:
+  top_k: 5
+
+query_expansion:
+  num_queries: 5

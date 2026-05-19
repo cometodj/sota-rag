@@ -1,0 +1,5 @@
+{"id": "q001", "question": "Explain the command options related to formatting behavior."}
+{"id": "q002", "question": "What fields define the operation mode for this feature?"}
+{"id": "q003", "question": "Describe the valid values and reserved values for the relevant option field."}
+{"id": "q004", "question": "Generate validation test cases for this feature."}
+{"id": "q005", "question": "What information should be checked to verify whether the feature is supported?"}
