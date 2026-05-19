@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.venv/
+.env
+
+# Data and outputs
+data/
+outputs/
+*.pdf
+
+# Vector DB
+chroma_db/
+outputs/chroma_db/
+
+# OS
+.DS_Store
