@@ -200,6 +200,43 @@ It summarizes:
 - The MVP uses one PDF and five benchmark questions.
 - Streamlit and LangGraph are intentionally not included.
 
+## Phase 2: Docling Comparison Plan
+
+Phase 2 will add Docling as an alternative document processing pipeline. Docling should not replace the
+current PyMuPDF baseline. The project should compare:
+
+- PyMuPDF baseline extraction and chunking
+- Docling structured extraction and structure-aware chunking
+
+Docling is not an embedding model. It should be used for structured document parsing, preserving document
+layout, sections, tables, and field context before chunking. Embedding models remain separate and
+configurable.
+
+For a fair comparison, both pipelines should use:
+
+- The same input PDF
+- The same benchmark questions
+- The same embedding model
+- The same retrieval `top_k`
+- The same evaluation/reporting format
+
+Parser-specific outputs should be stored separately. PyMuPDF chunks and Docling chunks should not be
+mixed in the same Chroma collection. Each parser and embedding model combination should use its own
+collection, for example:
+
+- `sample_doc_pymupdf_all_minilm_l6_v2`
+- `sample_doc_docling_all_minilm_l6_v2`
+
+The goal of the Docling comparison is to measure whether structured parsing and structure-aware chunking
+improve:
+
+- Retrieval coverage
+- Section preservation
+- Table and field context
+- Manual answerability of retrieved evidence
+
+Docling should be added only after the PyMuPDF baseline remains reproducible.
+
 ## Future Extension Plan
 
 Possible next steps:
@@ -207,8 +244,9 @@ Possible next steps:
 1. Add benchmark gold evidence labels such as expected pages, sections, or chunk IDs.
 2. Add retrieval metrics such as recall@k, hit rate, and MRR.
 3. Add a report section that compares original and expanded retrieval against gold evidence.
-4. Add answer generation after retrieval quality is measurable.
-5. Add optional judge-based evaluation after deterministic retrieval metrics exist.
-6. Test additional embedding models using separate Chroma collections.
-7. Add reranking or fusion methods after the baseline query expansion comparison is stable.
-8. Add a UI only after the command-line MVP is reliable.
+4. Add Docling structured parsing as a separate pipeline for comparison with PyMuPDF.
+5. Add answer generation after retrieval quality is measurable.
+6. Add optional judge-based evaluation after deterministic retrieval metrics exist.
+7. Test additional embedding models using separate Chroma collections.
+8. Add reranking or fusion methods after the baseline query expansion comparison is stable.
+9. Add a UI only after the command-line MVP is reliable.

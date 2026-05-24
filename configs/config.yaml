@@ -8,6 +8,14 @@ paths:
   benchmark_questions: "benchmark/benchmark_questions.jsonl"
   vector_db_dir: "outputs/chroma_db"
 
+pipelines:
+  pymupdf:
+    enabled: true
+    output_prefix: "pymupdf"
+  docling:
+    enabled: false
+    output_prefix: "docling"
+
 document:
   pdf_path: "data/sample.pdf"
 
