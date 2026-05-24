@@ -19,6 +19,7 @@ if str(SRC_DIR) not in sys.path:
 
 APP_TITLE = "SOTA RAG - MVP Result Viewer"
 CONFIG_PATH = Path("configs/config.yaml")
+BENCHMARK_QUESTIONS_PATH = Path("benchmark/benchmark_questions.jsonl")
 OUTPUT_DIR = Path("outputs")
 ORIGINAL_RESULTS_PATH = OUTPUT_DIR / "original_retrieval_results.jsonl"
 QUERY_EXPANSIONS_PATH = OUTPUT_DIR / "query_expansions.jsonl"
@@ -30,6 +31,7 @@ COMPARISON_REPORT_PATH = OUTPUT_DIR / "retrieval_comparison_report.md"
 PARSER_COMPARISON_CSV_PATH = OUTPUT_DIR / "parser_comparison.csv"
 PARSER_COMPARISON_REPORT_PATH = OUTPUT_DIR / "parser_comparison_report.md"
 EXPECTED_FILES = [
+    BENCHMARK_QUESTIONS_PATH,
     ORIGINAL_RESULTS_PATH,
     QUERY_EXPANSIONS_PATH,
     EXPANDED_RESULTS_PATH,
@@ -175,6 +177,10 @@ def chunk_evidence_label(chunk: dict[str, Any]) -> str:
         f"chunk_id={chunk.get('chunk_id', '')}",
         f"rank={chunk.get('rank', '')}",
     ]
+    if chunk.get("source"):
+        parts.append(f"source={chunk.get('source')}")
+    if chunk.get("retrieval_type"):
+        parts.append(f"retrieval_type={chunk.get('retrieval_type')}")
     if chunk.get("page_number") not in ("", None):
         parts.append(f"page_number={chunk.get('page_number')}")
     if chunk.get("section_title"):
@@ -203,7 +209,7 @@ Rules:
 - Do not infer fields, values, sections, or requirements that are not explicitly supported by the context.
 - If the context is insufficient, clearly say what is missing.
 - Keep the answer concise and technical.
-- Cite evidence using chunk_id, rank, page_number if available, and section_title if available.
+- Cite evidence using chunk_id, rank, source/parser, retrieval type, page_number if available, and section_title if available.
 
 Question:
 {query_text}
@@ -353,6 +359,104 @@ def query_expansion_map(records: list[dict[str, Any]]) -> dict[str, dict[str, An
         for record in records
         if record.get("question_id") is not None
     }
+
+
+def benchmark_question_map(records: list[dict[str, Any]]) -> dict[str, str]:
+    questions: dict[str, str] = {}
+    for record in records:
+        question_id = record.get("id") or record.get("question_id")
+        question = record.get("question")
+        if question_id is not None and question:
+            questions[str(question_id)] = str(question)
+    return questions
+
+
+def first_record_for_question(
+    records_by_question: dict[str, list[dict[str, Any]]],
+    question_id: str,
+) -> dict[str, Any] | None:
+    records = records_by_question.get(question_id, [])
+    return records[0] if records else None
+
+
+def annotated_chunk(
+    chunk: dict[str, Any],
+    source: str,
+    retrieval_type: str,
+) -> dict[str, Any]:
+    annotated = dict(chunk)
+    annotated["source"] = source
+    annotated["retrieval_type"] = retrieval_type
+    return annotated
+
+
+def original_answer_chunks(
+    records_by_question: dict[str, list[dict[str, Any]]],
+    question_id: str,
+    source: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    record = first_record_for_question(records_by_question, question_id)
+    if not record:
+        return []
+
+    chunks = record.get("retrieved_chunks", [])[:top_k]
+    return [annotated_chunk(chunk, source=source, retrieval_type="original") for chunk in chunks]
+
+
+def rank_value(chunk: dict[str, Any]) -> int:
+    return safe_int(chunk.get("rank"), default=10_000)
+
+
+def retrieval_quality_value(chunk: dict[str, Any]) -> float:
+    if chunk.get("distance") is not None:
+        try:
+            return float(chunk["distance"])
+        except (TypeError, ValueError):
+            return float("inf")
+
+    if chunk.get("score") is not None:
+        try:
+            return -float(chunk["score"])
+        except (TypeError, ValueError):
+            return float("inf")
+
+    return float("inf")
+
+
+def expanded_answer_chunks(
+    records_by_question: dict[str, list[dict[str, Any]]],
+    question_id: str,
+    source: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    best_chunks: dict[str, dict[str, Any]] = {}
+    for record in records_by_question.get(question_id, []):
+        for chunk in record.get("retrieved_chunks", []):
+            chunk_id = str(chunk.get("chunk_id", ""))
+            if not chunk_id:
+                continue
+
+            annotated = annotated_chunk(chunk, source=source, retrieval_type="expanded")
+            existing = best_chunks.get(chunk_id)
+            if existing is None:
+                best_chunks[chunk_id] = annotated
+                continue
+
+            existing_key = (rank_value(existing), retrieval_quality_value(existing))
+            candidate_key = (rank_value(annotated), retrieval_quality_value(annotated))
+            if candidate_key < existing_key:
+                best_chunks[chunk_id] = annotated
+
+    ranked_chunks = sorted(
+        best_chunks.values(),
+        key=lambda chunk: (
+            rank_value(chunk),
+            retrieval_quality_value(chunk),
+            str(chunk.get("chunk_id", "")),
+        ),
+    )
+    return ranked_chunks[:top_k]
 
 
 def first_question_text(
@@ -623,10 +727,31 @@ def render_manual_query_results(
         )
 
 
+def render_answer_panel(title: str, answer: str | None, chunks: list[dict[str, Any]]) -> None:
+    st.markdown(f"#### {title}")
+    st.caption(f"Context chunks: {len(chunks)}")
+    with st.expander("Context Chunks", expanded=False):
+        render_chunk_table(chunks, "No chunks available for this answer.")
+
+    if answer:
+        st.markdown(answer)
+    else:
+        st.info("No answer generated yet.")
+
+
+def render_manual_review_checklist() -> None:
+    st.markdown("#### Manual Review Checklist")
+    st.checkbox("Does the answer use the retrieved evidence?", key="review_uses_evidence")
+    st.checkbox("Does the answer include unsupported claims?", key="review_unsupported_claims")
+    st.checkbox("Does the answer miss important field/table details?", key="review_misses_details")
+    st.text_input("Which answer is most useful?", key="review_most_useful")
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
+    benchmark_records, benchmark_error = read_jsonl(BENCHMARK_QUESTIONS_PATH)
     original_records, original_error = read_jsonl(ORIGINAL_RESULTS_PATH)
     expansion_records, expansion_error = read_jsonl(QUERY_EXPANSIONS_PATH)
     expanded_records, expanded_error = read_jsonl(EXPANDED_RESULTS_PATH)
@@ -651,11 +776,13 @@ def main() -> None:
             docling_expanded_error,
             parser_comparison_error,
             parser_report_error,
+            benchmark_error,
         ]
         if error
     ]
     render_file_warnings(errors)
 
+    benchmark_questions = benchmark_question_map(benchmark_records)
     original_by_question = group_by_question(original_records)
     expansions_by_question = query_expansion_map(expansion_records)
     expanded_by_question = group_by_question(expanded_records)
@@ -670,10 +797,11 @@ def main() -> None:
     metric_cols[2].metric("Expanded retrieval records", len(expanded_records))
     metric_cols[3].metric("Query expansion records", len(expansion_records))
 
-    details_tab, manual_tab, parser_tab, comparison_tab, report_tab = st.tabs(
+    details_tab, manual_tab, benchmark_answer_tab, parser_tab, comparison_tab, report_tab = st.tabs(
         [
             "Question Details",
             "Manual Query",
+            "Benchmark Answer Comparison",
             "Parser Comparison",
             "Comparison CSV",
             "Markdown Report",
@@ -877,6 +1005,100 @@ def main() -> None:
                     query_text=str(st.session_state["manual_query_text"]),
                     settings=manual_settings,
                 )
+
+    with benchmark_answer_tab:
+        st.subheader("Benchmark Answer Comparison")
+        st.caption(
+            "Neutral comparison of answers generated from existing retrieval outputs."
+        )
+
+        if config_error:
+            st.warning(config_error)
+        elif manual_config_error:
+            st.warning(manual_config_error)
+        elif not benchmark_questions:
+            st.info("No benchmark questions were found.")
+        else:
+            benchmark_question_ids = sorted(benchmark_questions)
+            selected_benchmark_question_id = st.selectbox(
+                "Benchmark question",
+                options=benchmark_question_ids,
+                format_func=lambda question_id: f"{question_id} - {benchmark_questions[question_id]}",
+                key="benchmark_answer_question",
+            )
+            selected_benchmark_question = benchmark_questions[selected_benchmark_question_id]
+
+            st.write(
+                {
+                    "question_id": selected_benchmark_question_id,
+                    "question": selected_benchmark_question,
+                }
+            )
+
+            top_k = manual_settings["top_k"]
+            answer_contexts = {
+                "PyMuPDF Original": original_answer_chunks(
+                    original_by_question,
+                    selected_benchmark_question_id,
+                    source="pymupdf",
+                    top_k=top_k,
+                ),
+                "PyMuPDF Expanded": expanded_answer_chunks(
+                    expanded_by_question,
+                    selected_benchmark_question_id,
+                    source="pymupdf",
+                    top_k=top_k,
+                ),
+                "Docling Original": original_answer_chunks(
+                    docling_original_by_question,
+                    selected_benchmark_question_id,
+                    source="docling",
+                    top_k=top_k,
+                ),
+                "Docling Expanded": expanded_answer_chunks(
+                    docling_expanded_by_question,
+                    selected_benchmark_question_id,
+                    source="docling",
+                    top_k=top_k,
+                ),
+            }
+
+            context_cols = st.columns(4)
+            for column, (label, chunks) in zip(context_cols, answer_contexts.items()):
+                column.metric(label, len(chunks))
+
+            if st.button("Generate Answers for Selected Question", type="primary"):
+                answer_key = f"benchmark_answers_{selected_benchmark_question_id}"
+                try:
+                    generated_answers: dict[str, str] = {}
+                    for label, chunks in answer_contexts.items():
+                        with st.spinner(f"Generating answer: {label}..."):
+                            generated_answers[label] = generate_grounded_answer(
+                                query_text=selected_benchmark_question,
+                                chunks=chunks,
+                                settings=manual_settings,
+                            )
+                    st.session_state[answer_key] = generated_answers
+                except Exception as exc:
+                    st.error(f"Benchmark answer generation failed: {exc}")
+
+            answers = st.session_state.get(
+                f"benchmark_answers_{selected_benchmark_question_id}",
+                {},
+            )
+
+            first_row = st.columns(2)
+            second_row = st.columns(2)
+            panels = list(answer_contexts.items())
+            for column, (label, chunks) in zip(first_row + second_row, panels):
+                with column:
+                    render_answer_panel(
+                        title=label,
+                        answer=answers.get(label),
+                        chunks=chunks,
+                    )
+
+            render_manual_review_checklist()
 
     with parser_tab:
         st.subheader("Parser Comparison")
