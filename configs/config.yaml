@@ -26,6 +26,7 @@ chunking:
 embedding:
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
   collection_name: "sample_doc_all_minilm_l6_v2"
+  docling_collection_name: "sample_doc_docling_all_minilm_l6_v2"
 
 ollama:
   model_name: "qwen2.5:14b"
