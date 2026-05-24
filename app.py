@@ -23,14 +23,22 @@ OUTPUT_DIR = Path("outputs")
 ORIGINAL_RESULTS_PATH = OUTPUT_DIR / "original_retrieval_results.jsonl"
 QUERY_EXPANSIONS_PATH = OUTPUT_DIR / "query_expansions.jsonl"
 EXPANDED_RESULTS_PATH = OUTPUT_DIR / "expanded_retrieval_results.jsonl"
+DOCLING_ORIGINAL_RESULTS_PATH = OUTPUT_DIR / "original_retrieval_results_docling.jsonl"
+DOCLING_EXPANDED_RESULTS_PATH = OUTPUT_DIR / "expanded_retrieval_results_docling.jsonl"
 COMPARISON_CSV_PATH = OUTPUT_DIR / "retrieval_comparison.csv"
 COMPARISON_REPORT_PATH = OUTPUT_DIR / "retrieval_comparison_report.md"
+PARSER_COMPARISON_CSV_PATH = OUTPUT_DIR / "parser_comparison.csv"
+PARSER_COMPARISON_REPORT_PATH = OUTPUT_DIR / "parser_comparison_report.md"
 EXPECTED_FILES = [
     ORIGINAL_RESULTS_PATH,
     QUERY_EXPANSIONS_PATH,
     EXPANDED_RESULTS_PATH,
     COMPARISON_CSV_PATH,
     COMPARISON_REPORT_PATH,
+    DOCLING_ORIGINAL_RESULTS_PATH,
+    DOCLING_EXPANDED_RESULTS_PATH,
+    PARSER_COMPARISON_CSV_PATH,
+    PARSER_COMPARISON_REPORT_PATH,
 ]
 PREVIEW_LIMIT = 420
 
@@ -67,6 +75,7 @@ def format_retrieved_chunks(query_result: dict[str, Any]) -> list[dict[str, Any]
             "chunk_id": str(metadata.get("chunk_id", chunk_id)),
             "document_name": str(metadata.get("document_name", "")),
             "page_number": metadata.get("page_number", ""),
+            "section_title": metadata.get("section_title", ""),
             "chunk_index": metadata.get("chunk_index", ""),
             "text": str(documents[index]),
         }
@@ -117,7 +126,8 @@ def manual_query_config(config: dict[str, Any]) -> tuple[dict[str, Any], str | N
     try:
         settings = {
             "vector_db_dir": str(config["paths"]["vector_db_dir"]),
-            "collection_name": str(config["embedding"]["collection_name"]),
+            "pymupdf_collection_name": str(config["embedding"]["collection_name"]),
+            "docling_collection_name": str(config["embedding"]["docling_collection_name"]),
             "embedding_model_name": str(config["embedding"]["model_name"]),
             "top_k": int(config["retrieval"]["top_k"]),
             "ollama_model_name": str(config["ollama"]["model_name"]),
@@ -135,6 +145,19 @@ def manual_query_config(config: dict[str, Any]) -> tuple[dict[str, Any], str | N
     return settings, None
 
 
+def manual_source_options(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
+    return {
+        "PyMuPDF baseline": {
+            "source": "pymupdf",
+            "collection_name": settings["pymupdf_collection_name"],
+        },
+        "Docling structured parser": {
+            "source": "docling",
+            "collection_name": settings["docling_collection_name"],
+        },
+    }
+
+
 def expand_manual_query(query_text: str, settings: dict[str, Any]) -> list[str]:
     from query_expansion import generate_expanded_queries
 
@@ -147,17 +170,116 @@ def expand_manual_query(query_text: str, settings: dict[str, Any]) -> list[str]:
     return expanded_queries
 
 
-def retrieve_manual_query(query_text: str, top_k: int, settings: dict[str, Any]) -> list[dict[str, Any]]:
+def chunk_evidence_label(chunk: dict[str, Any]) -> str:
+    parts = [
+        f"chunk_id={chunk.get('chunk_id', '')}",
+        f"rank={chunk.get('rank', '')}",
+    ]
+    if chunk.get("page_number") not in ("", None):
+        parts.append(f"page_number={chunk.get('page_number')}")
+    if chunk.get("section_title"):
+        parts.append(f"section_title={chunk.get('section_title')}")
+    return ", ".join(parts)
+
+
+def build_answer_prompt(query_text: str, chunks: list[dict[str, Any]]) -> str:
+    context_blocks = []
+    for chunk in chunks:
+        context_blocks.append(
+            "\n".join(
+                [
+                    f"[{chunk_evidence_label(chunk)}]",
+                    str(chunk.get("text", "")),
+                ]
+            )
+        )
+
+    context = "\n\n---\n\n".join(context_blocks)
+    return f"""You answer technical-document questions using only retrieved context.
+
+Rules:
+- Use only the retrieved context below.
+- Do not use outside knowledge.
+- Do not infer fields, values, sections, or requirements that are not explicitly supported by the context.
+- If the context is insufficient, clearly say what is missing.
+- Keep the answer concise and technical.
+- Cite evidence using chunk_id, rank, page_number if available, and section_title if available.
+
+Question:
+{query_text}
+
+Retrieved context:
+{context}
+
+Return exactly these sections:
+## Answer Summary
+## Evidence Used
+## Missing or Uncertain Information
+"""
+
+
+def generate_grounded_answer(
+    query_text: str,
+    chunks: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> str:
+    if not chunks:
+        return (
+            "## Answer Summary\n"
+            "The retrieved context is insufficient because no chunks were provided.\n\n"
+            "## Evidence Used\n"
+            "- None\n\n"
+            "## Missing or Uncertain Information\n"
+            "- No retrieved chunks were available for answer generation.\n"
+        )
+
+    import ollama
+
+    try:
+        response = ollama.generate(
+            model=settings["ollama_model_name"],
+            prompt=build_answer_prompt(query_text, chunks),
+            options={"temperature": settings["ollama_temperature"]},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to generate answer with Ollama. "
+            f"Check that Ollama is running and model '{settings['ollama_model_name']}' is available."
+        ) from exc
+
+    return str(response["response"]).strip()
+
+
+def retrieve_manual_query(
+    query_text: str,
+    top_k: int,
+    settings: dict[str, Any],
+    collection_name: str,
+    source: str,
+) -> list[dict[str, Any]]:
     embedding_model = load_embedding_model(settings["embedding_model_name"])
-    collection = load_chroma_collection(settings["vector_db_dir"], settings["collection_name"])
+    try:
+        collection = load_chroma_collection(settings["vector_db_dir"], collection_name)
+    except Exception as exc:
+        if source == "docling":
+            raise RuntimeError(
+                "Docling collection is not available. Build it before using this mode: "
+                "python src/vector_store.py --source docling"
+            ) from exc
+        raise RuntimeError(f"Selected collection does not exist: {collection_name}") from exc
 
     metadata = collection.metadata or {}
     existing_model_name = metadata.get("embedding_model")
     if existing_model_name != settings["embedding_model_name"]:
         raise ValueError(
             "Chroma collection embedding model mismatch: "
-            f"collection={settings['collection_name']}, existing={existing_model_name}, "
+            f"collection={collection_name}, existing={existing_model_name}, "
             f"configured={settings['embedding_model_name']}"
+        )
+    if source == "docling" and metadata.get("source") != "docling":
+        raise ValueError(
+            "Selected collection is not marked as a Docling collection. "
+            f"collection={collection_name}, source={metadata.get('source')}"
         )
 
     query_embedding = embedding_model.embed_texts([query_text])[0]
@@ -279,6 +401,7 @@ def chunk_rows(chunks: list[dict[str, Any]], highlight_ids: set[str] | None = No
                 "chunk_id": chunk_id,
                 "document_name": chunk.get("document_name", ""),
                 "page_number": chunk.get("page_number", ""),
+                "section_title": chunk.get("section_title", ""),
                 "chunk_index": chunk.get("chunk_index", ""),
                 "score_or_distance": score_or_distance,
                 "expanded_only": chunk_id in highlight_ids,
@@ -330,6 +453,176 @@ def render_file_warnings(errors: list[str]) -> None:
         st.caption(error)
 
 
+def first_original_record(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return records[0] if records else None
+
+
+def comparison_question_ids(
+    comparison_df: pd.DataFrame,
+    *record_groups: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    question_ids: set[str] = set()
+    if not comparison_df.empty and "question_id" in comparison_df.columns:
+        question_ids.update(str(question_id) for question_id in comparison_df["question_id"].dropna())
+
+    for group in record_groups:
+        question_ids.update(group)
+
+    return sorted(question_ids)
+
+
+def question_label(
+    question_id: str,
+    parser_comparison_df: pd.DataFrame,
+    *record_groups: dict[str, list[dict[str, Any]]],
+) -> str:
+    if not parser_comparison_df.empty and "question_id" in parser_comparison_df.columns:
+        rows = parser_comparison_df[parser_comparison_df["question_id"].astype(str) == question_id]
+        if not rows.empty and "question" in rows.columns:
+            question = str(rows.iloc[0]["question"])
+            if question:
+                return f"{question_id} - {question}"
+
+    for group in record_groups:
+        records = group.get(question_id, [])
+        if records:
+            question = records[0].get("question") or records[0].get("original_question")
+            if question:
+                return f"{question_id} - {question}"
+
+    return question_id
+
+
+def parser_metric_value(row: pd.Series | None, column: str) -> int:
+    if row is None or column not in row:
+        return 0
+    return safe_int(row[column])
+
+
+def render_expanded_records(
+    records: list[dict[str, Any]],
+    empty_message: str,
+) -> None:
+    if not records:
+        st.info(empty_message)
+        return
+
+    for record in sorted(records, key=lambda item: safe_int(item.get("expanded_query_index"))):
+        query_index = safe_int(record.get("expanded_query_index")) + 1
+        query_text = str(record.get("query_text", ""))
+        with st.expander(f"Expanded query {query_index}: {query_text}", expanded=False):
+            render_chunk_table(
+                record.get("retrieved_chunks", []),
+                "No retrieved chunks found for this expanded query.",
+            )
+
+
+def render_answer_generation(
+    label: str,
+    query_text: str,
+    chunks: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> None:
+    answer_key = f"manual_answer_{label}"
+    button_key = f"generate_answer_{label}"
+
+    if st.button(f"Generate Answer - {label}", key=button_key):
+        try:
+            with st.spinner(f"Generating grounded answer from {label} chunks..."):
+                st.session_state[answer_key] = generate_grounded_answer(
+                    query_text=query_text,
+                    chunks=chunks,
+                    settings=settings,
+                )
+        except Exception as exc:
+            st.error(f"Answer generation failed: {exc}")
+
+    if answer_key in st.session_state:
+        st.markdown(st.session_state[answer_key])
+
+
+def render_manual_query_results(
+    source_choice: str,
+    use_query_expansion: bool,
+    expanded_queries: list[str],
+    manual_results: dict[str, dict[str, Any]],
+    query_text: str,
+    settings: dict[str, Any],
+) -> None:
+    if use_query_expansion:
+        st.markdown("#### Expanded Queries")
+        if expanded_queries:
+            for index, expanded_query in enumerate(expanded_queries, start=1):
+                st.write(f"{index}. {expanded_query}")
+        else:
+            st.info("Ollama did not return any expanded queries.")
+
+    if source_choice == "Compare both":
+        result_cols = st.columns(2)
+        for column, (label, result) in zip(result_cols, manual_results.items()):
+            with column:
+                st.markdown(f"#### {label}")
+                st.caption(f"Collection: `{result['collection_name']}`")
+                st.markdown("##### Original Retrieval")
+                render_chunk_table(
+                    result["original_chunks"],
+                    "No chunks were retrieved for the original query.",
+                )
+                render_answer_generation(
+                    label=label,
+                    query_text=query_text,
+                    chunks=result["original_chunks"],
+                    settings=settings,
+                )
+
+                if use_query_expansion:
+                    st.markdown("##### Expanded Retrieval")
+                    render_expanded_records(
+                        result["expanded_records"],
+                        "No expanded retrieval records were generated.",
+                    )
+        return
+
+    result = next(iter(manual_results.values()))
+    st.caption(f"Collection: `{result['collection_name']}`")
+    st.markdown("#### Original Retrieval")
+    render_chunk_table(
+        result["original_chunks"],
+        "No chunks were retrieved for the original query.",
+    )
+    render_answer_generation(
+        label=source_choice,
+        query_text=query_text,
+        chunks=result["original_chunks"],
+        settings=settings,
+    )
+
+    if use_query_expansion:
+        original_chunk_ids = {
+            str(chunk.get("chunk_id", "")) for chunk in result["original_chunks"]
+        }
+        expanded_chunks_by_id = unique_chunks(result["expanded_records"])
+        expanded_only_ids = set(expanded_chunks_by_id) - original_chunk_ids
+        expanded_only_chunks = [
+            chunk
+            for chunk_id, chunk in expanded_chunks_by_id.items()
+            if chunk_id in expanded_only_ids
+        ]
+
+        st.markdown("#### Expanded-Only Chunks")
+        render_chunk_table(
+            expanded_only_chunks,
+            "No chunks were found only by expanded queries.",
+            highlight_ids=expanded_only_ids,
+        )
+
+        st.markdown("#### Expanded Retrieval")
+        render_expanded_records(
+            result["expanded_records"],
+            "No expanded retrieval records were generated.",
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -337,8 +630,12 @@ def main() -> None:
     original_records, original_error = read_jsonl(ORIGINAL_RESULTS_PATH)
     expansion_records, expansion_error = read_jsonl(QUERY_EXPANSIONS_PATH)
     expanded_records, expanded_error = read_jsonl(EXPANDED_RESULTS_PATH)
+    docling_original_records, docling_original_error = read_jsonl(DOCLING_ORIGINAL_RESULTS_PATH)
+    docling_expanded_records, docling_expanded_error = read_jsonl(DOCLING_EXPANDED_RESULTS_PATH)
     comparison_df, comparison_error = read_csv(COMPARISON_CSV_PATH)
     report_markdown, report_error = read_markdown(COMPARISON_REPORT_PATH)
+    parser_comparison_df, parser_comparison_error = read_csv(PARSER_COMPARISON_CSV_PATH)
+    parser_report_markdown, parser_report_error = read_markdown(PARSER_COMPARISON_REPORT_PATH)
     config, config_error = load_config(CONFIG_PATH)
     manual_settings, manual_config_error = manual_query_config(config) if config else ({}, None)
 
@@ -350,6 +647,10 @@ def main() -> None:
             expanded_error,
             comparison_error,
             report_error,
+            docling_original_error,
+            docling_expanded_error,
+            parser_comparison_error,
+            parser_report_error,
         ]
         if error
     ]
@@ -358,6 +659,8 @@ def main() -> None:
     original_by_question = group_by_question(original_records)
     expansions_by_question = query_expansion_map(expansion_records)
     expanded_by_question = group_by_question(expanded_records)
+    docling_original_by_question = group_by_question(docling_original_records)
+    docling_expanded_by_question = group_by_question(docling_expanded_records)
     question_ids = all_question_ids(original_records, expansion_records, expanded_records)
 
     st.subheader("Overview")
@@ -367,8 +670,14 @@ def main() -> None:
     metric_cols[2].metric("Expanded retrieval records", len(expanded_records))
     metric_cols[3].metric("Query expansion records", len(expansion_records))
 
-    details_tab, manual_tab, comparison_tab, report_tab = st.tabs(
-        ["Question Details", "Manual Query", "Comparison CSV", "Markdown Report"]
+    details_tab, manual_tab, parser_tab, comparison_tab, report_tab = st.tabs(
+        [
+            "Question Details",
+            "Manual Query",
+            "Parser Comparison",
+            "Comparison CSV",
+            "Markdown Report",
+        ]
     )
 
     with details_tab:
@@ -464,13 +773,21 @@ def main() -> None:
             config_cols = st.columns(3)
             config_cols[0].caption(f"Embedding model: `{manual_settings['embedding_model_name']}`")
             config_cols[1].caption(f"Chroma path: `{manual_settings['vector_db_dir']}`")
-            config_cols[2].caption(f"Collection: `{manual_settings['collection_name']}`")
+            config_cols[2].caption(
+                "Collections: "
+                f"`{manual_settings['pymupdf_collection_name']}`, "
+                f"`{manual_settings['docling_collection_name']}`"
+            )
             st.caption(
                 "Ollama expansion model: "
                 f"`{manual_settings['ollama_model_name']}` "
                 f"({manual_settings['num_expanded_queries']} queries)"
             )
 
+            source_choice = st.selectbox(
+                "Parser/source",
+                options=["PyMuPDF baseline", "Docling structured parser", "Compare both"],
+            )
             manual_query = st.text_area(
                 "Custom technical document question",
                 placeholder="Type a question to retrieve matching chunks from the current Chroma DB.",
@@ -493,83 +810,215 @@ def main() -> None:
                     st.warning(f"Chroma DB path does not exist: {manual_settings['vector_db_dir']}")
                 else:
                     try:
-                        with st.spinner("Retrieving chunks for the original query..."):
-                            original_manual_chunks = retrieve_manual_query(
-                                query_text=query_text,
-                                top_k=int(top_k),
-                                settings=manual_settings,
-                            )
+                        source_options = manual_source_options(manual_settings)
+                        selected_sources = (
+                            list(source_options.items())
+                            if source_choice == "Compare both"
+                            else [(source_choice, source_options[source_choice])]
+                        )
 
                         expanded_queries: list[str] = []
-                        expanded_records: list[dict[str, Any]] = []
                         if use_query_expansion:
                             with st.spinner("Generating expanded queries with Ollama..."):
                                 expanded_queries = expand_manual_query(query_text, manual_settings)
 
-                            with st.spinner("Retrieving chunks for expanded queries..."):
-                                for index, expanded_query in enumerate(expanded_queries):
-                                    expanded_records.append(
-                                        {
-                                            "query_text": expanded_query,
-                                            "expanded_query_index": index,
-                                            "retrieved_chunks": retrieve_manual_query(
-                                                query_text=expanded_query,
-                                                top_k=int(top_k),
-                                                settings=manual_settings,
-                                            ),
-                                        }
-                                    )
+                        manual_results: dict[str, dict[str, Any]] = {}
+                        for label, source_config in selected_sources:
+                            with st.spinner(f"Retrieving chunks from {label}..."):
+                                original_chunks = retrieve_manual_query(
+                                    query_text=query_text,
+                                    top_k=int(top_k),
+                                    settings=manual_settings,
+                                    collection_name=source_config["collection_name"],
+                                    source=source_config["source"],
+                                )
+
+                                expanded_records: list[dict[str, Any]] = []
+                                if use_query_expansion:
+                                    for index, expanded_query in enumerate(expanded_queries):
+                                        expanded_records.append(
+                                            {
+                                                "query_text": expanded_query,
+                                                "expanded_query_index": index,
+                                                "retrieved_chunks": retrieve_manual_query(
+                                                    query_text=expanded_query,
+                                                    top_k=int(top_k),
+                                                    settings=manual_settings,
+                                                    collection_name=source_config["collection_name"],
+                                                    source=source_config["source"],
+                                                ),
+                                            }
+                                        )
+
+                            manual_results[label] = {
+                                "original_chunks": original_chunks,
+                                "expanded_records": expanded_records,
+                                "collection_name": source_config["collection_name"],
+                            }
+                        st.session_state["manual_query_text"] = query_text
+                        st.session_state["manual_results"] = manual_results
+                        st.session_state["manual_source_choice"] = source_choice
+                        st.session_state["manual_use_query_expansion"] = use_query_expansion
+                        st.session_state["manual_expanded_queries"] = expanded_queries
+                        for key in list(st.session_state):
+                            if str(key).startswith("manual_answer_"):
+                                del st.session_state[key]
                     except Exception as exc:
                         st.error(f"Manual retrieval failed: {exc}")
                     else:
-                        st.markdown("#### Original Retrieval")
-                        render_chunk_table(
-                            original_manual_chunks,
-                            "No chunks were retrieved for the original query.",
-                        )
+                        st.success("Retrieval complete.")
 
-                        if use_query_expansion:
-                            st.markdown("#### Expanded Queries")
-                            if expanded_queries:
-                                for index, expanded_query in enumerate(expanded_queries, start=1):
-                                    st.write(f"{index}. {expanded_query}")
-                            else:
-                                st.info("Ollama did not return any expanded queries.")
+            if "manual_results" in st.session_state:
+                render_manual_query_results(
+                    source_choice=str(st.session_state["manual_source_choice"]),
+                    use_query_expansion=bool(st.session_state["manual_use_query_expansion"]),
+                    expanded_queries=list(st.session_state["manual_expanded_queries"]),
+                    manual_results=dict(st.session_state["manual_results"]),
+                    query_text=str(st.session_state["manual_query_text"]),
+                    settings=manual_settings,
+                )
 
-                            original_chunk_ids = {
-                                str(chunk.get("chunk_id", "")) for chunk in original_manual_chunks
-                            }
-                            expanded_chunks_by_id = unique_chunks(expanded_records)
-                            expanded_only_ids = set(expanded_chunks_by_id) - original_chunk_ids
-                            expanded_only_chunks = [
-                                chunk
-                                for chunk_id, chunk in expanded_chunks_by_id.items()
-                                if chunk_id in expanded_only_ids
-                            ]
+    with parser_tab:
+        st.subheader("Parser Comparison")
+        st.caption(
+            "Neutral side-by-side view of existing PyMuPDF and Docling retrieval outputs."
+        )
 
-                            st.markdown("#### Expanded-Only Chunks")
-                            render_chunk_table(
-                                expanded_only_chunks,
-                                "No chunks were found only by expanded queries.",
-                                highlight_ids=expanded_only_ids,
-                            )
+        parser_question_ids = comparison_question_ids(
+            parser_comparison_df,
+            original_by_question,
+            docling_original_by_question,
+            expanded_by_question,
+            docling_expanded_by_question,
+        )
 
-                            st.markdown("#### Expanded Retrieval")
-                            if not expanded_records:
-                                st.info("No expanded retrieval records were generated.")
-                            else:
-                                for record in expanded_records:
-                                    query_index = safe_int(record.get("expanded_query_index")) + 1
-                                    query_text = str(record.get("query_text", ""))
-                                    with st.expander(
-                                        f"Expanded query {query_index}: {query_text}",
-                                        expanded=False,
-                                    ):
-                                        render_chunk_table(
-                                            record.get("retrieved_chunks", []),
-                                            "No chunks were retrieved for this expanded query.",
-                                            highlight_ids=expanded_only_ids,
-                                        )
+        total_pymupdf_only = (
+            int(parser_comparison_df["pymupdf_only_count"].sum())
+            if not parser_comparison_df.empty and "pymupdf_only_count" in parser_comparison_df
+            else 0
+        )
+        total_docling_only = (
+            int(parser_comparison_df["docling_only_count"].sum())
+            if not parser_comparison_df.empty and "docling_only_count" in parser_comparison_df
+            else 0
+        )
+        total_overlap = (
+            int(parser_comparison_df["overlap_count"].sum())
+            if not parser_comparison_df.empty and "overlap_count" in parser_comparison_df
+            else 0
+        )
+
+        parser_metric_cols = st.columns(4)
+        parser_metric_cols[0].metric("Questions compared", len(parser_question_ids))
+        parser_metric_cols[1].metric("PyMuPDF-only chunks", total_pymupdf_only)
+        parser_metric_cols[2].metric("Docling-only chunks", total_docling_only)
+        parser_metric_cols[3].metric("Overlap", total_overlap)
+
+        if not parser_question_ids:
+            st.info("No parser comparison records were found.")
+        else:
+            selected_parser_question_id = st.selectbox(
+                "Parser comparison question",
+                options=parser_question_ids,
+                format_func=lambda question_id: question_label(
+                    question_id,
+                    parser_comparison_df,
+                    original_by_question,
+                    docling_original_by_question,
+                    expanded_by_question,
+                    docling_expanded_by_question,
+                ),
+            )
+
+            selected_rows = (
+                parser_comparison_df[
+                    parser_comparison_df["question_id"].astype(str) == selected_parser_question_id
+                ]
+                if not parser_comparison_df.empty and "question_id" in parser_comparison_df.columns
+                else pd.DataFrame()
+            )
+            selected_row = selected_rows.iloc[0] if not selected_rows.empty else None
+
+            question_cols = st.columns(4)
+            question_cols[0].metric(
+                "PyMuPDF unique",
+                parser_metric_value(selected_row, "pymupdf_unique_chunk_count"),
+            )
+            question_cols[1].metric(
+                "Docling unique",
+                parser_metric_value(selected_row, "docling_unique_chunk_count"),
+            )
+            question_cols[2].metric(
+                "PyMuPDF only",
+                parser_metric_value(selected_row, "pymupdf_only_count"),
+            )
+            question_cols[3].metric(
+                "Docling only",
+                parser_metric_value(selected_row, "docling_only_count"),
+            )
+
+            if selected_row is not None:
+                st.write(
+                    {
+                        "overlap_count": parser_metric_value(selected_row, "overlap_count"),
+                        "top_pymupdf_pages": selected_row.get("top_pymupdf_pages", ""),
+                        "top_docling_pages": selected_row.get("top_docling_pages", ""),
+                        "top_docling_section_titles": selected_row.get(
+                            "top_docling_section_titles",
+                            "",
+                        ),
+                    }
+                )
+
+            pymupdf_original_record = first_original_record(
+                original_by_question.get(selected_parser_question_id, [])
+            )
+            docling_original_record = first_original_record(
+                docling_original_by_question.get(selected_parser_question_id, [])
+            )
+            pymupdf_expanded_records = expanded_by_question.get(selected_parser_question_id, [])
+            selected_docling_expanded_records = docling_expanded_by_question.get(
+                selected_parser_question_id,
+                [],
+            )
+
+            original_cols = st.columns(2)
+            with original_cols[0]:
+                st.markdown("#### PyMuPDF Original Retrieval")
+                render_chunk_table(
+                    pymupdf_original_record.get("retrieved_chunks", [])
+                    if pymupdf_original_record
+                    else [],
+                    "No PyMuPDF original retrieval chunks found for this question.",
+                )
+            with original_cols[1]:
+                st.markdown("#### Docling Original Retrieval")
+                render_chunk_table(
+                    docling_original_record.get("retrieved_chunks", [])
+                    if docling_original_record
+                    else [],
+                    "No Docling original retrieval chunks found for this question.",
+                )
+
+            expanded_cols = st.columns(2)
+            with expanded_cols[0]:
+                st.markdown("#### PyMuPDF Expanded Retrieval")
+                render_expanded_records(
+                    pymupdf_expanded_records,
+                    "No PyMuPDF expanded retrieval records found for this question.",
+                )
+            with expanded_cols[1]:
+                st.markdown("#### Docling Expanded Retrieval")
+                render_expanded_records(
+                    selected_docling_expanded_records,
+                    "No Docling expanded retrieval records found for this question.",
+                )
+
+        with st.expander("Parser Comparison Report", expanded=False):
+            if parser_report_markdown:
+                st.markdown(parser_report_markdown)
+            else:
+                st.info("No parser comparison report available.")
 
     with comparison_tab:
         st.subheader("Retrieval Comparison CSV")
