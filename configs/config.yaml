@@ -16,6 +16,21 @@ pipelines:
     enabled: false
     output_prefix: "docling"
 
+parsers:
+  available:
+    - id: "pymupdf"
+      name: "PyMuPDF Baseline"
+      enabled: true
+      status: "ready"
+    - id: "docling"
+      name: "Docling Structured Parser"
+      enabled: true
+      status: "ready"
+    - id: "pdfplumber"
+      name: "pdfplumber"
+      enabled: false
+      status: "coming_soon"
+
 document:
   pdf_path: "data/sample.pdf"
 

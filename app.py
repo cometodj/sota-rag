@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -43,6 +46,18 @@ EXPECTED_FILES = [
     PARSER_COMPARISON_REPORT_PATH,
 ]
 PREVIEW_LIMIT = 420
+RUNS_DIR = OUTPUT_DIR / "runs"
+EMBEDDING_MODEL_OPTIONS = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "BAAI/bge-small-en-v1.5",
+    "BAAI/bge-m3",
+]
+ANSWER_MODEL_OPTIONS = [
+    "qwen2.5:14b",
+    "llama3.1:8b",
+    "gemma3:12b",
+]
+PARSER_OPTIONS = ["PyMuPDF", "Docling"]
 
 
 def normalize_text(value: Any) -> str:
@@ -61,6 +76,248 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def unique_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique_values: list[str] = []
+    for value in values:
+        if value not in seen:
+            unique_values.append(value)
+            seen.add(value)
+    return unique_values
+
+
+def is_ollama_embedding_model(model_name: str) -> bool:
+    normalized = model_name.casefold()
+    embedding_markers = [
+        "embed",
+        "embedding",
+        "bge",
+        "minilm",
+        "mxbai",
+        "nomic",
+        "snowflake-arctic",
+    ]
+    return any(marker in normalized for marker in embedding_markers)
+
+
+def is_ollama_answer_model(model_name: str) -> bool:
+    normalized = model_name.casefold()
+    excluded_markers = [
+        "embed",
+        "embedding",
+        "bge",
+        "minilm",
+        "mxbai",
+        "nomic",
+        "snowflake-arctic",
+        "whisper",
+        "ocr",
+    ]
+    return not any(marker in normalized for marker in excluded_markers)
+
+
+@st.cache_data(show_spinner=False)
+def ollama_model_names() -> tuple[list[str], str | None]:
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return [], f"Could not read local Ollama model list: {exc}"
+
+    model_names: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        model_names.append(line.split()[0])
+
+    return model_names, None
+
+
+def benchmark_model_options() -> tuple[list[str], list[str], str | None]:
+    ollama_models, ollama_error = ollama_model_names()
+    ollama_embedding_models = [
+        model_name for model_name in ollama_models if is_ollama_embedding_model(model_name)
+    ]
+    ollama_answer_models = [
+        model_name for model_name in ollama_models if is_ollama_answer_model(model_name)
+    ]
+
+    embedding_options = unique_preserve_order(
+        EMBEDDING_MODEL_OPTIONS + sorted(ollama_embedding_models, key=str.casefold)
+    )
+    answer_options = unique_preserve_order(
+        ANSWER_MODEL_OPTIONS + sorted(ollama_answer_models, key=str.casefold)
+    )
+    return embedding_options, answer_options, ollama_error
+
+
+def generate_run_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}_{uuid4().hex[:8]}"
+
+
+def save_benchmark_run_config(
+    run_config: dict[str, Any],
+    uploaded_pdf: Any,
+    uploaded_questions: Any | None = None,
+) -> tuple[str, Path, Path]:
+    run_id = str(run_config["run_id"])
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    uploaded_pdf_path = run_dir / "uploaded.pdf"
+    uploaded_pdf_path.write_bytes(uploaded_pdf.getvalue())
+    run_config["pdf"] = {
+        "mode": "uploaded",
+        "filename": uploaded_pdf.name,
+        "saved_path": str(uploaded_pdf_path),
+    }
+
+    if uploaded_questions is not None:
+        questions_path = run_dir / "benchmark_questions.jsonl"
+        questions_path.write_bytes(uploaded_questions.getvalue())
+        run_config["benchmark_questions"] = {
+            "mode": "uploaded",
+            "filename": uploaded_questions.name,
+            "saved_path": str(questions_path),
+        }
+
+    config_path = run_dir / "run_config.yaml"
+    config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
+    return run_id, run_dir, config_path
+
+
+def render_saved_run(run_id: str, run_dir: Path, config_path: Path, run_config: dict[str, Any]) -> None:
+    st.success(f"Saved benchmark run configuration: {run_id}")
+    st.write({"run_id": run_id, "run_dir": str(run_dir), "config_path": str(config_path)})
+    st.code(yaml.safe_dump(run_config, sort_keys=False), language="yaml")
+
+
+def benchmark_question_file_control(key_prefix: str) -> tuple[str, Any | None]:
+    mode = st.radio(
+        "Benchmark questions",
+        options=[
+            "Use existing benchmark/benchmark_questions.jsonl",
+            "Upload benchmark questions JSONL",
+        ],
+        key=f"{key_prefix}_question_mode",
+    )
+    if mode.startswith("Upload"):
+        uploaded_questions = st.file_uploader(
+            "Benchmark questions JSONL",
+            type=["jsonl"],
+            key=f"{key_prefix}_questions_upload",
+        )
+        return mode, uploaded_questions
+    return mode, None
+
+
+def base_run_config(
+    experiment_type: str,
+    top_k: int,
+    question_mode: str,
+) -> dict[str, Any]:
+    return {
+        "run_id": generate_run_id(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "experiment_type": experiment_type,
+        "top_k": int(top_k),
+        "benchmark_questions": {
+            "mode": "existing" if question_mode.startswith("Use existing") else "uploaded",
+            "path": str(BENCHMARK_QUESTIONS_PATH) if question_mode.startswith("Use existing") else None,
+        },
+        "query_expansion": {
+            "included": False,
+            "note": "Query expansion is intentionally excluded from this phase and will be added later.",
+        },
+        "execution": {
+            "status": "configured_only",
+            "note": "The full benchmark execution engine is not run from this UI yet.",
+        },
+    }
+
+
+def validate_benchmark_inputs(uploaded_pdf: Any, uploaded_questions: Any | None, question_mode: str) -> list[str]:
+    errors: list[str] = []
+    if uploaded_pdf is None:
+        errors.append("Upload a PDF before saving a benchmark run.")
+    if question_mode.startswith("Upload") and uploaded_questions is None:
+        errors.append("Upload a benchmark questions JSONL file or use the existing benchmark file.")
+    return errors
+
+
+def render_placeholder_status() -> None:
+    with st.status("Benchmark setup saved", expanded=True) as status:
+        st.write("Validated controlled experiment settings.")
+        st.write("Saved uploaded PDF and run_config.yaml.")
+        st.write("Full benchmark execution is intentionally not started yet.")
+        status.update(label="Ready for future benchmark execution", state="complete")
+
+
+def parser_registry(config: dict[str, Any]) -> list[dict[str, Any]]:
+    parsers = config.get("parsers", {}).get("available", [])
+    if isinstance(parsers, list) and parsers:
+        return [parser for parser in parsers if isinstance(parser, dict)]
+
+    return [
+        {
+            "id": "pymupdf",
+            "name": "PyMuPDF Baseline",
+            "enabled": True,
+            "status": "ready",
+        },
+        {
+            "id": "docling",
+            "name": "Docling Structured Parser",
+            "enabled": True,
+            "status": "ready",
+        },
+    ]
+
+
+def ready_parser_options(config: dict[str, Any]) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    for parser in parser_registry(config):
+        if parser.get("enabled") is True and parser.get("status") == "ready":
+            options.append((str(parser["id"]), str(parser["name"])))
+    return options
+
+
+def render_parser_checkboxes(config: dict[str, Any]) -> list[str]:
+    selected_parser_ids: list[str] = []
+    st.markdown("Parser candidates")
+
+    for parser in parser_registry(config):
+        parser_id = str(parser.get("id", ""))
+        parser_name = str(parser.get("name", parser_id))
+        enabled = parser.get("enabled") is True
+        status = str(parser.get("status", "unknown"))
+        selectable = enabled and status == "ready"
+        label = f"{parser_name} (`{parser_id}`)"
+        help_text = f"status={status}, enabled={enabled}"
+
+        selected = st.checkbox(
+            label,
+            value=selectable,
+            disabled=not selectable,
+            help=help_text,
+            key=f"parser_compare_{parser_id}",
+        )
+        if selected and selectable:
+            selected_parser_ids.append(parser_id)
+
+        if not selectable:
+            st.caption(f"{parser_name} is not selectable yet: {help_text}")
+
+    return selected_parser_ids
 
 
 def format_retrieved_chunks(query_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -747,6 +1004,233 @@ def render_manual_review_checklist() -> None:
     st.text_input("Which answer is most useful?", key="review_most_useful")
 
 
+def render_benchmark_tool(config: dict[str, Any]) -> None:
+    experiment_type = st.selectbox(
+        "Experiment Type",
+        options=[
+            "Parser Comparison",
+            "Embedding Model Comparison",
+            "Answer Model Comparison",
+            "Full Auto Recommendation (coming soon)",
+        ],
+    )
+
+    st.info(
+        "Query expansion is intentionally excluded from this phase and will be added later."
+    )
+
+    if experiment_type == "Full Auto Recommendation (coming soon)":
+        st.warning("Full Auto Recommendation is disabled for now.")
+        st.button("Run Full Auto Recommendation", disabled=True)
+        return
+
+    uploaded_pdf = st.file_uploader(
+        "PDF upload",
+        type=["pdf"],
+        key=f"{experiment_type}_pdf_upload",
+    )
+    question_mode, uploaded_questions = benchmark_question_file_control(experiment_type)
+
+    embedding_model_options, answer_model_options, ollama_error = benchmark_model_options()
+    if ollama_error:
+        st.caption(f"{ollama_error}. Using default model options.")
+    else:
+        st.caption(
+            f"Loaded {len(embedding_model_options)} embedding options and "
+            f"{len(answer_model_options)} answer options from defaults plus local Ollama models."
+        )
+
+    default_embedding = str(
+        config.get("embedding", {}).get("model_name", embedding_model_options[0])
+    )
+    default_answer = str(config.get("ollama", {}).get("model_name", answer_model_options[0]))
+    default_top_k = safe_int(config.get("retrieval", {}).get("top_k"), default=5)
+
+    if experiment_type == "Parser Comparison":
+        st.caption(
+            "Parser Comparison changes only the document parser while keeping the embedding model "
+            "and answer model fixed. This helps isolate the effect of document parsing on retrieval "
+            "and answer quality."
+        )
+        selected_parser_ids = render_parser_checkboxes(config)
+        embedding_model = st.selectbox(
+            "Embedding model",
+            options=embedding_model_options,
+            index=embedding_model_options.index(default_embedding)
+            if default_embedding in embedding_model_options
+            else 0,
+        )
+        answer_model = st.selectbox(
+            "Answer model",
+            options=answer_model_options,
+            index=answer_model_options.index(default_answer)
+            if default_answer in answer_model_options
+            else 0,
+        )
+        top_k = st.number_input(
+            "top_k",
+            min_value=1,
+            max_value=50,
+            value=default_top_k,
+            step=1,
+            key="parser_benchmark_top_k",
+        )
+
+        run_disabled = len(selected_parser_ids) < 2
+        if run_disabled:
+            st.warning("Select at least two parsers to run Parser Comparison.")
+
+        if st.button("Run Parser Benchmark", type="primary", disabled=run_disabled):
+            validation_errors = validate_benchmark_inputs(uploaded_pdf, uploaded_questions, question_mode)
+            if len(selected_parser_ids) < 2:
+                validation_errors.append("Select at least two parsers to run Parser Comparison.")
+            if validation_errors:
+                for error in validation_errors:
+                    st.warning(error)
+            else:
+                run_config = base_run_config(experiment_type, int(top_k), question_mode)
+                run_config.update(
+                    {
+                        "experiment_type": "parser_comparison",
+                        "purpose": "Compare selected parsers while keeping embedding model and answer model fixed.",
+                        "selected_parsers": selected_parser_ids,
+                        "embedding_model": embedding_model,
+                        "answer_model": answer_model,
+                        "controlled_variables": {
+                            "embedding_model": embedding_model,
+                            "answer_model": answer_model,
+                        },
+                        "variable_under_test": "parser",
+                    }
+                )
+                run_id, run_dir, config_path = save_benchmark_run_config(
+                    run_config,
+                    uploaded_pdf,
+                    uploaded_questions,
+                )
+                run_config["uploaded_pdf_path"] = run_config["pdf"]["saved_path"]
+                run_config["benchmark_questions_path"] = run_config["benchmark_questions"][
+                    "saved_path" if uploaded_questions is not None else "path"
+                ]
+                config_path.write_text(
+                    yaml.safe_dump(run_config, sort_keys=False),
+                    encoding="utf-8",
+                )
+                render_placeholder_status()
+                render_saved_run(run_id, run_dir, config_path, run_config)
+        return
+
+    if experiment_type == "Embedding Model Comparison":
+        st.caption("Compare embedding models while keeping parser and answer model fixed.")
+        parser = st.selectbox("Parser", options=PARSER_OPTIONS)
+        embedding_models = st.multiselect(
+            "Embedding models",
+            options=embedding_model_options,
+            default=[default_embedding] if default_embedding in embedding_model_options else [],
+        )
+        answer_model = st.selectbox(
+            "Answer model",
+            options=answer_model_options,
+            index=answer_model_options.index(default_answer)
+            if default_answer in answer_model_options
+            else 0,
+        )
+        top_k = st.number_input(
+            "top_k",
+            min_value=1,
+            max_value=50,
+            value=default_top_k,
+            step=1,
+            key="embedding_benchmark_top_k",
+        )
+
+        if st.button("Run Embedding Benchmark", type="primary"):
+            validation_errors = validate_benchmark_inputs(uploaded_pdf, uploaded_questions, question_mode)
+            if len(embedding_models) < 2:
+                validation_errors.append("Select at least two embedding models for comparison.")
+            if validation_errors:
+                for error in validation_errors:
+                    st.warning(error)
+            else:
+                run_config = base_run_config(experiment_type, int(top_k), question_mode)
+                run_config.update(
+                    {
+                        "purpose": "Compare multiple embedding models while keeping parser and answer model fixed.",
+                        "parser": parser.lower(),
+                        "embedding_models": embedding_models,
+                        "answer_models": [answer_model],
+                        "controlled_variables": {
+                            "parser": parser.lower(),
+                            "answer_model": answer_model,
+                        },
+                        "variable_under_test": "embedding_model",
+                    }
+                )
+                run_id, run_dir, config_path = save_benchmark_run_config(
+                    run_config,
+                    uploaded_pdf,
+                    uploaded_questions,
+                )
+                render_placeholder_status()
+                render_saved_run(run_id, run_dir, config_path, run_config)
+        return
+
+    st.caption("Compare answer models while keeping parser, embedding model, and retrieved chunks fixed.")
+    parser = st.selectbox("Parser", options=PARSER_OPTIONS, key="answer_benchmark_parser")
+    embedding_model = st.selectbox(
+        "Embedding model",
+        options=embedding_model_options,
+        index=embedding_model_options.index(default_embedding)
+        if default_embedding in embedding_model_options
+        else 0,
+        key="answer_benchmark_embedding",
+    )
+    answer_models = st.multiselect(
+        "Answer models",
+        options=answer_model_options,
+        default=[default_answer] if default_answer in answer_model_options else [],
+    )
+    top_k = st.number_input(
+        "top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="answer_benchmark_top_k",
+    )
+
+    if st.button("Run Answer Benchmark", type="primary"):
+        validation_errors = validate_benchmark_inputs(uploaded_pdf, uploaded_questions, question_mode)
+        if len(answer_models) < 2:
+            validation_errors.append("Select at least two answer models for comparison.")
+        if validation_errors:
+            for error in validation_errors:
+                st.warning(error)
+        else:
+            run_config = base_run_config(experiment_type, int(top_k), question_mode)
+            run_config.update(
+                {
+                    "purpose": "Compare multiple answer generation models while keeping parser, embedding model, and retrieved chunks fixed.",
+                    "parser": parser.lower(),
+                    "embedding_models": [embedding_model],
+                    "answer_models": answer_models,
+                    "controlled_variables": {
+                        "parser": parser.lower(),
+                        "embedding_model": embedding_model,
+                        "retrieved_chunks": "fixed",
+                    },
+                    "variable_under_test": "answer_model",
+                }
+            )
+            run_id, run_dir, config_path = save_benchmark_run_config(
+                run_config,
+                uploaded_pdf,
+                uploaded_questions,
+            )
+            render_placeholder_status()
+            render_saved_run(run_id, run_dir, config_path, run_config)
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -797,8 +1281,17 @@ def main() -> None:
     metric_cols[2].metric("Expanded retrieval records", len(expanded_records))
     metric_cols[3].metric("Query expansion records", len(expansion_records))
 
-    details_tab, manual_tab, benchmark_answer_tab, parser_tab, comparison_tab, report_tab = st.tabs(
+    (
+        benchmark_tool_tab,
+        details_tab,
+        manual_tab,
+        benchmark_answer_tab,
+        parser_tab,
+        comparison_tab,
+        report_tab,
+    ) = st.tabs(
         [
+            "Benchmark Tool",
             "Question Details",
             "Manual Query",
             "Benchmark Answer Comparison",
@@ -807,6 +1300,9 @@ def main() -> None:
             "Markdown Report",
         ]
     )
+
+    with benchmark_tool_tab:
+        render_benchmark_tool(config)
 
     with details_tab:
         if not question_ids:
@@ -927,6 +1423,7 @@ def main() -> None:
                 max_value=50,
                 value=manual_settings["top_k"],
                 step=1,
+                key="manual_query_top_k",
             )
             use_query_expansion = st.checkbox("Use Ollama query expansion")
 
