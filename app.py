@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
+import yaml
+
+
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.append(str(SRC_DIR))
 
 
 APP_TITLE = "SOTA RAG - MVP Result Viewer"
+CONFIG_PATH = Path("configs/config.yaml")
 OUTPUT_DIR = Path("outputs")
 ORIGINAL_RESULTS_PATH = OUTPUT_DIR / "original_retrieval_results.jsonl"
 QUERY_EXPANSIONS_PATH = OUTPUT_DIR / "query_expansions.jsonl"
@@ -42,6 +51,122 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def format_retrieved_chunks(query_result: dict[str, Any]) -> list[dict[str, Any]]:
+    ids = query_result.get("ids", [[]])[0]
+    documents = query_result.get("documents", [[]])[0]
+    metadatas = query_result.get("metadatas", [[]])[0]
+    distances = query_result.get("distances", [[]])[0]
+
+    retrieved_chunks: list[dict[str, Any]] = []
+    for index, chunk_id in enumerate(ids):
+        metadata = metadatas[index] or {}
+        chunk: dict[str, Any] = {
+            "rank": index + 1,
+            "chunk_id": str(metadata.get("chunk_id", chunk_id)),
+            "document_name": str(metadata.get("document_name", "")),
+            "page_number": metadata.get("page_number", ""),
+            "chunk_index": metadata.get("chunk_index", ""),
+            "text": str(documents[index]),
+        }
+
+        if distances:
+            chunk["distance"] = distances[index]
+
+        retrieved_chunks.append(chunk)
+
+    return retrieved_chunks
+
+
+@st.cache_data(show_spinner=False)
+def load_config(path: Path = CONFIG_PATH) -> tuple[dict[str, Any], str | None]:
+    if not path.exists():
+        return {}, f"Missing config file: {path}"
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            config = yaml.safe_load(file)
+    except yaml.YAMLError as exc:
+        return {}, f"Could not parse {path}: {exc}"
+    except OSError as exc:
+        return {}, f"Could not read {path}: {exc}"
+
+    if not isinstance(config, dict):
+        return {}, f"Config file must contain a YAML mapping: {path}"
+
+    return config, None
+
+
+@st.cache_resource(show_spinner=False)
+def load_embedding_model(model_name: str) -> Any:
+    from embeddings import EmbeddingModel
+
+    return EmbeddingModel(model_name)
+
+
+@st.cache_resource(show_spinner=False)
+def load_chroma_collection(vector_db_dir: str, collection_name: str) -> Any:
+    import chromadb
+
+    client = chromadb.PersistentClient(path=vector_db_dir)
+    return client.get_collection(name=collection_name)
+
+
+def manual_query_config(config: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    try:
+        settings = {
+            "vector_db_dir": str(config["paths"]["vector_db_dir"]),
+            "collection_name": str(config["embedding"]["collection_name"]),
+            "embedding_model_name": str(config["embedding"]["model_name"]),
+            "top_k": int(config["retrieval"]["top_k"]),
+            "ollama_model_name": str(config["ollama"]["model_name"]),
+            "ollama_temperature": float(config["ollama"]["temperature"]),
+            "num_expanded_queries": int(config["query_expansion"]["num_queries"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        return {}, f"Missing or invalid manual query config value: {exc}"
+
+    if settings["top_k"] <= 0:
+        return {}, "Configured retrieval.top_k must be greater than 0."
+    if settings["num_expanded_queries"] <= 0:
+        return {}, "Configured query_expansion.num_queries must be greater than 0."
+
+    return settings, None
+
+
+def expand_manual_query(query_text: str, settings: dict[str, Any]) -> list[str]:
+    from query_expansion import generate_expanded_queries
+
+    expanded_queries, _raw_response = generate_expanded_queries(
+        question=query_text,
+        model_name=settings["ollama_model_name"],
+        num_queries=settings["num_expanded_queries"],
+        temperature=settings["ollama_temperature"],
+    )
+    return expanded_queries
+
+
+def retrieve_manual_query(query_text: str, top_k: int, settings: dict[str, Any]) -> list[dict[str, Any]]:
+    embedding_model = load_embedding_model(settings["embedding_model_name"])
+    collection = load_chroma_collection(settings["vector_db_dir"], settings["collection_name"])
+
+    metadata = collection.metadata or {}
+    existing_model_name = metadata.get("embedding_model")
+    if existing_model_name != settings["embedding_model_name"]:
+        raise ValueError(
+            "Chroma collection embedding model mismatch: "
+            f"collection={settings['collection_name']}, existing={existing_model_name}, "
+            f"configured={settings['embedding_model_name']}"
+        )
+
+    query_embedding = embedding_model.embed_texts([query_text])[0]
+    query_result = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+    return format_retrieved_chunks(query_result)
 
 
 @st.cache_data(show_spinner=False)
@@ -214,6 +339,8 @@ def main() -> None:
     expanded_records, expanded_error = read_jsonl(EXPANDED_RESULTS_PATH)
     comparison_df, comparison_error = read_csv(COMPARISON_CSV_PATH)
     report_markdown, report_error = read_markdown(COMPARISON_REPORT_PATH)
+    config, config_error = load_config(CONFIG_PATH)
+    manual_settings, manual_config_error = manual_query_config(config) if config else ({}, None)
 
     errors = [
         error
@@ -240,8 +367,8 @@ def main() -> None:
     metric_cols[2].metric("Expanded retrieval records", len(expanded_records))
     metric_cols[3].metric("Query expansion records", len(expansion_records))
 
-    details_tab, comparison_tab, report_tab = st.tabs(
-        ["Question Details", "Comparison CSV", "Markdown Report"]
+    details_tab, manual_tab, comparison_tab, report_tab = st.tabs(
+        ["Question Details", "Manual Query", "Comparison CSV", "Markdown Report"]
     )
 
     with details_tab:
@@ -325,6 +452,124 @@ def main() -> None:
                             "No retrieved chunks found for this expanded query.",
                             highlight_ids=expanded_only_ids,
                         )
+
+    with manual_tab:
+        st.subheader("Manual Query")
+
+        if config_error:
+            st.warning(config_error)
+        elif manual_config_error:
+            st.warning(manual_config_error)
+        else:
+            config_cols = st.columns(3)
+            config_cols[0].caption(f"Embedding model: `{manual_settings['embedding_model_name']}`")
+            config_cols[1].caption(f"Chroma path: `{manual_settings['vector_db_dir']}`")
+            config_cols[2].caption(f"Collection: `{manual_settings['collection_name']}`")
+            st.caption(
+                "Ollama expansion model: "
+                f"`{manual_settings['ollama_model_name']}` "
+                f"({manual_settings['num_expanded_queries']} queries)"
+            )
+
+            manual_query = st.text_area(
+                "Custom technical document question",
+                placeholder="Type a question to retrieve matching chunks from the current Chroma DB.",
+                height=120,
+            )
+            top_k = st.number_input(
+                "top_k",
+                min_value=1,
+                max_value=50,
+                value=manual_settings["top_k"],
+                step=1,
+            )
+            use_query_expansion = st.checkbox("Use Ollama query expansion")
+
+            if st.button("Search", type="primary"):
+                query_text = manual_query.strip()
+                if not query_text:
+                    st.warning("Enter a query before searching.")
+                elif not Path(manual_settings["vector_db_dir"]).exists():
+                    st.warning(f"Chroma DB path does not exist: {manual_settings['vector_db_dir']}")
+                else:
+                    try:
+                        with st.spinner("Retrieving chunks for the original query..."):
+                            original_manual_chunks = retrieve_manual_query(
+                                query_text=query_text,
+                                top_k=int(top_k),
+                                settings=manual_settings,
+                            )
+
+                        expanded_queries: list[str] = []
+                        expanded_records: list[dict[str, Any]] = []
+                        if use_query_expansion:
+                            with st.spinner("Generating expanded queries with Ollama..."):
+                                expanded_queries = expand_manual_query(query_text, manual_settings)
+
+                            with st.spinner("Retrieving chunks for expanded queries..."):
+                                for index, expanded_query in enumerate(expanded_queries):
+                                    expanded_records.append(
+                                        {
+                                            "query_text": expanded_query,
+                                            "expanded_query_index": index,
+                                            "retrieved_chunks": retrieve_manual_query(
+                                                query_text=expanded_query,
+                                                top_k=int(top_k),
+                                                settings=manual_settings,
+                                            ),
+                                        }
+                                    )
+                    except Exception as exc:
+                        st.error(f"Manual retrieval failed: {exc}")
+                    else:
+                        st.markdown("#### Original Retrieval")
+                        render_chunk_table(
+                            original_manual_chunks,
+                            "No chunks were retrieved for the original query.",
+                        )
+
+                        if use_query_expansion:
+                            st.markdown("#### Expanded Queries")
+                            if expanded_queries:
+                                for index, expanded_query in enumerate(expanded_queries, start=1):
+                                    st.write(f"{index}. {expanded_query}")
+                            else:
+                                st.info("Ollama did not return any expanded queries.")
+
+                            original_chunk_ids = {
+                                str(chunk.get("chunk_id", "")) for chunk in original_manual_chunks
+                            }
+                            expanded_chunks_by_id = unique_chunks(expanded_records)
+                            expanded_only_ids = set(expanded_chunks_by_id) - original_chunk_ids
+                            expanded_only_chunks = [
+                                chunk
+                                for chunk_id, chunk in expanded_chunks_by_id.items()
+                                if chunk_id in expanded_only_ids
+                            ]
+
+                            st.markdown("#### Expanded-Only Chunks")
+                            render_chunk_table(
+                                expanded_only_chunks,
+                                "No chunks were found only by expanded queries.",
+                                highlight_ids=expanded_only_ids,
+                            )
+
+                            st.markdown("#### Expanded Retrieval")
+                            if not expanded_records:
+                                st.info("No expanded retrieval records were generated.")
+                            else:
+                                for record in expanded_records:
+                                    query_index = safe_int(record.get("expanded_query_index")) + 1
+                                    query_text = str(record.get("query_text", ""))
+                                    with st.expander(
+                                        f"Expanded query {query_index}: {query_text}",
+                                        expanded=False,
+                                    ):
+                                        render_chunk_table(
+                                            record.get("retrieved_chunks", []),
+                                            "No chunks were retrieved for this expanded query.",
+                                            highlight_ids=expanded_only_ids,
+                                        )
 
     with comparison_tab:
         st.subheader("Retrieval Comparison CSV")
