@@ -1096,6 +1096,14 @@ def render_benchmark_tool(config: dict[str, Any]) -> None:
                         "selected_parsers": selected_parser_ids,
                         "embedding_model": embedding_model,
                         "answer_model": answer_model,
+                        "chunk_size": safe_int(
+                            config.get("chunking", {}).get("chunk_size"),
+                            default=800,
+                        ),
+                        "chunk_overlap": safe_int(
+                            config.get("chunking", {}).get("chunk_overlap"),
+                            default=150,
+                        ),
                         "controlled_variables": {
                             "embedding_model": embedding_model,
                             "answer_model": answer_model,
@@ -1116,7 +1124,26 @@ def render_benchmark_tool(config: dict[str, Any]) -> None:
                     yaml.safe_dump(run_config, sort_keys=False),
                     encoding="utf-8",
                 )
-                render_placeholder_status()
+                progress_bar = st.progress(0)
+                with st.status("Running parser comparison benchmark", expanded=True) as status:
+                    try:
+                        from benchmark_runner import run_parser_comparison
+
+                        def update_progress(message: str, step: int, total: int) -> None:
+                            progress_bar.progress(step / total)
+                            st.write(message)
+
+                        runner_result = run_parser_comparison(
+                            config_path,
+                            progress_callback=update_progress,
+                        )
+                    except Exception as exc:
+                        status.update(label="Parser benchmark failed", state="error")
+                        st.error(f"Parser benchmark failed: {exc}")
+                        return
+
+                    status.update(label="Parser benchmark complete", state="complete")
+                st.write(runner_result)
                 render_saved_run(run_id, run_dir, config_path, run_config)
         return
 
