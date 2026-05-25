@@ -50,6 +50,9 @@ def read_benchmark_questions(path: Path) -> list[dict[str, str]]:
 
             questions.append({"id": str(question_id), "question": str(question)})
 
+    if not questions:
+        raise ValueError(f"Benchmark question file is empty: {path}")
+
     return questions
 
 
@@ -192,7 +195,10 @@ def retrieve_questions(
     questions: list[dict[str, str]],
     collection: Any,
     embedding_model: BenchmarkEmbeddingModel,
+    run_id: str,
+    experiment_type: str,
     parser_id: str,
+    chunking_strategy: str,
     embedding_model_name: str,
     top_k: int,
 ) -> list[dict[str, Any]]:
@@ -206,7 +212,10 @@ def retrieve_questions(
         )
         records.append(
             {
+                "run_id": run_id,
+                "experiment_type": experiment_type,
                 "parser": parser_id,
+                "chunking_strategy": chunking_strategy,
                 "embedding_model": embedding_model_name,
                 "question_id": question["id"],
                 "question": question["question"],
@@ -284,7 +293,10 @@ def generate_answers(
     for record in retrieval_records:
         answers.append(
             {
+                "run_id": record["run_id"],
+                "experiment_type": record["experiment_type"],
                 "parser": record["parser"],
+                "chunking_strategy": record["chunking_strategy"],
                 "embedding_model": record["embedding_model"],
                 "answer_model": answer_model,
                 "question_id": record["question_id"],
@@ -450,7 +462,7 @@ def write_comparison_report(
     return csv_path, report_path
 
 
-def run_parser_comparison(
+def run_parser_compare(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -469,6 +481,25 @@ def run_parser_comparison(
     if unsupported:
         raise ValueError(f"Unsupported parser(s) for runner: {unsupported}")
 
+    experiment_type = str(run_config.get("experiment_type", "parser_compare"))
+    if experiment_type != "parser_compare":
+        raise ValueError(f"run_parser_compare only supports experiment_type=parser_compare: {experiment_type}")
+
+    chunking_strategy = str(run_config.get("chunking_strategy", "fixed-size"))
+    if chunking_strategy != "fixed-size":
+        raise ValueError(
+            "Parser Compare runner currently supports only chunking_strategy='fixed-size'. "
+            f"Received: {chunking_strategy}"
+        )
+
+    retrieval_strategy = str(run_config.get("retrieval_strategy", "dense_vector"))
+    if retrieval_strategy != "dense_vector":
+        raise ValueError(
+            "Parser Compare runner currently supports only retrieval_strategy='dense_vector'. "
+            f"Received: {retrieval_strategy}"
+        )
+
+    run_id = str(run_config["run_id"])
     embedding_model_name = str(run_config["embedding_model"])
     answer_model = str(run_config["answer_model"])
     top_k = int(run_config["top_k"])
@@ -482,7 +513,7 @@ def run_parser_comparison(
     embedding_model = BenchmarkEmbeddingModel(embedding_model_name)
     parser_results: dict[str, dict[str, Any]] = {}
 
-    total_steps = 2 + (len(parser_ids) * 5) + 1
+    total_steps = 7
     step = 0
 
     def progress(message: str) -> None:
@@ -496,55 +527,96 @@ def run_parser_comparison(
     progress("Preparing run folder")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    progress("Loaded benchmark questions")
-
+    progress("Extracting documents")
+    chunks_by_parser: dict[str, list[dict[str, Any]]] = {}
     for parser_id in parser_ids:
         parser_dir = run_dir / parser_id
         parser_dir.mkdir(parents=True, exist_ok=True)
+        chunks_by_parser[parser_id] = extract_and_chunk(
+            parser_id,
+            pdf_path,
+            parser_dir,
+            chunk_size,
+            chunk_overlap,
+        )
 
-        progress(f"Running parser extraction: {parser_id}")
-        chunks = extract_and_chunk(parser_id, pdf_path, parser_dir, chunk_size, chunk_overlap)
+    progress("Chunking")
+    for parser_id, chunks in chunks_by_parser.items():
+        write_jsonl(chunks, run_dir / parser_id / "chunks.jsonl")
 
-        progress(f"Chunking complete: {parser_id}")
-
-        progress(f"Building vector DB: {parser_id}")
+    progress("Building vector DB")
+    collections_by_parser: dict[str, Any] = {}
+    collection_names_by_parser: dict[str, str] = {}
+    for parser_id, chunks in chunks_by_parser.items():
         collection_name = make_collection_name(
             parser_id=parser_id,
             embedding_model_name=embedding_model_name,
-            run_id=str(run_config["run_id"]),
+            run_id=run_id,
         )
         collection = client.get_or_create_collection(
             name=collection_name,
-            metadata={"parser": parser_id, "embedding_model": embedding_model_name},
+            metadata={
+                "parser": parser_id,
+                "embedding_model": embedding_model_name,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": retrieval_strategy,
+            },
         )
         index_chunks(chunks, collection, embedding_model, parser_id)
+        collections_by_parser[parser_id] = collection
+        collection_names_by_parser[parser_id] = collection_name
 
-        progress(f"Running retrieval: {parser_id}")
-        retrieval_records = retrieve_questions(
-            questions=questions,
-            collection=collection,
-            embedding_model=embedding_model,
-            parser_id=parser_id,
-            embedding_model_name=embedding_model_name,
-            top_k=top_k,
-        )
+    progress("Running retrieval")
+    for parser_id, collection in collections_by_parser.items():
+        parser_dir = run_dir / parser_id
+        if not chunks_by_parser[parser_id]:
+            retrieval_records = [
+                {
+                    "run_id": run_id,
+                    "experiment_type": experiment_type,
+                    "parser": parser_id,
+                    "chunking_strategy": chunking_strategy,
+                    "embedding_model": embedding_model_name,
+                    "question_id": question["id"],
+                    "question": question["question"],
+                    "top_k": top_k,
+                    "retrieved_chunks": [],
+                }
+                for question in questions
+            ]
+        else:
+            retrieval_records = retrieve_questions(
+                questions=questions,
+                collection=collection,
+                embedding_model=embedding_model,
+                run_id=run_id,
+                experiment_type=experiment_type,
+                parser_id=parser_id,
+                chunking_strategy=chunking_strategy,
+                embedding_model_name=embedding_model_name,
+                top_k=top_k,
+            )
         write_jsonl(retrieval_records, parser_dir / "retrieval_results.jsonl")
-
-        progress(f"Generating answers: {parser_id}")
-        answer_records = generate_answers(retrieval_records, answer_model)
-        write_jsonl(answer_records, parser_dir / "answer_results.jsonl")
         parser_results[parser_id] = {
-            "collection_name": collection_name,
-            "chunk_count": len(chunks),
+            "collection_name": collection_names_by_parser[parser_id],
+            "chunk_count": len(chunks_by_parser[parser_id]),
             "retrieval_records": retrieval_records,
-            "answer_records": answer_records,
+            "answer_records": [],
         }
 
-    progress("Generating comparison report")
+    progress("Generating answers")
+    for parser_id, result in parser_results.items():
+        parser_dir = run_dir / parser_id
+        answer_records = generate_answers(result["retrieval_records"], answer_model)
+        write_jsonl(answer_records, parser_dir / "answer_results.jsonl")
+        result["answer_records"] = answer_records
+
+    progress("Saving report")
     csv_path, report_path = write_comparison_report(run_dir, questions, parser_results)
 
     return {
-        "run_id": run_config["run_id"],
+        "run_id": run_id,
+        "experiment_type": experiment_type,
         "run_dir": str(run_dir),
         "chroma_dir": str(chroma_dir),
         "parsers": parser_ids,
@@ -564,6 +636,13 @@ def run_parser_comparison(
     }
 
 
+def run_parser_comparison(
+    run_config_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    return run_parser_compare(run_config_path, progress_callback=progress_callback)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run benchmark experiments.")
     parser.add_argument(
@@ -577,5 +656,5 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    result = run_parser_comparison(args.run_config)
+    result = run_parser_compare(args.run_config)
     print(json.dumps(result, indent=2))

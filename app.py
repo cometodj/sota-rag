@@ -20,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.append(str(SRC_DIR))
 
 
-APP_TITLE = "SOTA RAG - MVP Result Viewer"
+APP_TITLE = "SOTA RAG - Benchmark Setup"
 CONFIG_PATH = Path("configs/config.yaml")
 BENCHMARK_QUESTIONS_PATH = Path("benchmark/benchmark_questions.jsonl")
 OUTPUT_DIR = Path("outputs")
@@ -58,6 +58,12 @@ ANSWER_MODEL_OPTIONS = [
     "gemma3:12b",
 ]
 PARSER_OPTIONS = ["PyMuPDF", "Docling"]
+PARSER_ID_BY_LABEL = {
+    "PyMuPDF": "pymupdf",
+    "Docling": "docling",
+}
+CHUNKING_STRATEGY_OPTIONS = ["fixed-size", "page-based", "section-aware"]
+DEFAULT_RETRIEVAL_STRATEGY = "dense_vector"
 
 
 def normalize_text(value: Any) -> str:
@@ -195,6 +201,29 @@ def save_benchmark_run_config(
     return run_id, run_dir, config_path
 
 
+def save_setup_only_run_config(
+    run_config: dict[str, Any],
+    uploaded_pdf: Any,
+) -> tuple[str, Path, Path]:
+    run_id = str(run_config["run_id"])
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    uploaded_pdf_path = run_dir / "uploaded.pdf"
+    uploaded_pdf_path.write_bytes(uploaded_pdf.getvalue())
+
+    questions_path = run_dir / "benchmark_questions.jsonl"
+    questions_path.write_bytes(BENCHMARK_QUESTIONS_PATH.read_bytes())
+
+    run_config["uploaded_pdf_path"] = str(uploaded_pdf_path)
+    run_config["benchmark_questions_source_path"] = str(BENCHMARK_QUESTIONS_PATH)
+    run_config["benchmark_questions_path"] = str(questions_path)
+
+    config_path = run_dir / "run_config.yaml"
+    config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
+    return run_id, run_dir, config_path
+
+
 def render_saved_run(run_id: str, run_dir: Path, config_path: Path, run_config: dict[str, Any]) -> None:
     st.success(f"Saved benchmark run configuration: {run_id}")
     st.write({"run_id": run_id, "run_dir": str(run_dir), "config_path": str(config_path)})
@@ -255,10 +284,15 @@ def validate_benchmark_inputs(uploaded_pdf: Any, uploaded_questions: Any | None,
 
 
 def render_placeholder_status() -> None:
+    progress_bar = st.progress(0)
     with st.status("Benchmark setup saved", expanded=True) as status:
         st.write("Validated controlled experiment settings.")
-        st.write("Saved uploaded PDF and run_config.yaml.")
-        st.write("Full benchmark execution is intentionally not started yet.")
+        progress_bar.progress(33)
+        st.write("Saved uploaded PDF.")
+        progress_bar.progress(66)
+        st.write("Saved run_config.yaml.")
+        progress_bar.progress(100)
+        st.write("Benchmark execution is intentionally not started yet.")
         status.update(label="Ready for future benchmark execution", state="complete")
 
 
@@ -1124,26 +1158,7 @@ def render_benchmark_tool(config: dict[str, Any]) -> None:
                     yaml.safe_dump(run_config, sort_keys=False),
                     encoding="utf-8",
                 )
-                progress_bar = st.progress(0)
-                with st.status("Running parser comparison benchmark", expanded=True) as status:
-                    try:
-                        from benchmark_runner import run_parser_comparison
-
-                        def update_progress(message: str, step: int, total: int) -> None:
-                            progress_bar.progress(step / total)
-                            st.write(message)
-
-                        runner_result = run_parser_comparison(
-                            config_path,
-                            progress_callback=update_progress,
-                        )
-                    except Exception as exc:
-                        status.update(label="Parser benchmark failed", state="error")
-                        st.error(f"Parser benchmark failed: {exc}")
-                        return
-
-                    status.update(label="Parser benchmark complete", state="complete")
-                st.write(runner_result)
+                render_placeholder_status()
                 render_saved_run(run_id, run_dir, config_path, run_config)
         return
 
@@ -1258,533 +1273,491 @@ def render_benchmark_tool(config: dict[str, Any]) -> None:
             render_saved_run(run_id, run_dir, config_path, run_config)
 
 
+def default_index(options: list[str], preferred: str) -> int:
+    return options.index(preferred) if preferred in options else 0
+
+
+def benchmark_defaults(config: dict[str, Any]) -> tuple[list[str], list[str], str, str, int]:
+    embedding_model_options, answer_model_options, ollama_error = benchmark_model_options()
+    if ollama_error:
+        st.caption(f"{ollama_error}. Using default model options.")
+    else:
+        st.caption(
+            f"Loaded {len(embedding_model_options)} embedding options and "
+            f"{len(answer_model_options)} answer options from defaults plus local Ollama models."
+        )
+
+    default_embedding = str(
+        config.get("embedding", {}).get("model_name", embedding_model_options[0])
+    )
+    default_answer = str(config.get("ollama", {}).get("model_name", answer_model_options[0]))
+    default_top_k = safe_int(config.get("retrieval", {}).get("top_k"), default=5)
+    return embedding_model_options, answer_model_options, default_embedding, default_answer, default_top_k
+
+
+def setup_run_config(experiment_type: str, top_k: int) -> dict[str, Any]:
+    return {
+        "run_id": generate_run_id(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "experiment_type": experiment_type,
+        "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
+        "top_k": int(top_k),
+        "uploaded_pdf_path": None,
+        "benchmark_questions_path": str(BENCHMARK_QUESTIONS_PATH),
+        "execution": {
+            "status": "configured_only",
+            "note": "Benchmark execution is intentionally not run from this UI yet.",
+        },
+    }
+
+
+def validate_setup_inputs(uploaded_pdf: Any, required_errors: list[str]) -> list[str]:
+    errors = []
+    if uploaded_pdf is None:
+        errors.append("Upload a PDF before saving a benchmark run.")
+    _questions, questions_error = load_benchmark_questions_for_ui()
+    if questions_error and questions_error not in required_errors:
+        errors.append(questions_error)
+    errors.extend(required_errors)
+    return errors
+
+
+def load_benchmark_questions_for_ui(path: Path = BENCHMARK_QUESTIONS_PATH) -> tuple[list[dict[str, str]], str | None]:
+    records, error = read_jsonl(path)
+    if error:
+        return [], error
+    if not records:
+        return [], f"Benchmark question file is empty: {path}"
+
+    questions: list[dict[str, str]] = []
+    for index, record in enumerate(records, start=1):
+        question_id = record.get("id")
+        question = record.get("question")
+        if question_id is None or question is None:
+            return [], f"Missing id/question in benchmark question record {index}: {path}"
+        questions.append({"id": str(question_id), "question": str(question)})
+
+    return questions, None
+
+
+def render_benchmark_questions_preview(questions: list[dict[str, str]], error: str | None) -> None:
+    st.markdown("#### Benchmark Questions")
+    st.caption(f"Default source: `{BENCHMARK_QUESTIONS_PATH}`")
+    if error:
+        st.error(error)
+        return
+
+    st.dataframe(
+        pd.DataFrame(questions),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def selected_parser_ids_from_checkboxes(key_prefix: str) -> list[str]:
+    selected: list[str] = []
+    for parser_label in PARSER_OPTIONS:
+        checked = st.checkbox(
+            parser_label,
+            value=True,
+            key=f"{key_prefix}_{PARSER_ID_BY_LABEL[parser_label]}",
+        )
+        if checked:
+            selected.append(PARSER_ID_BY_LABEL[parser_label])
+    return selected
+
+
+def selected_options_from_checkboxes(
+    label: str,
+    options: list[str],
+    default_selected: list[str],
+    key_prefix: str,
+) -> list[str]:
+    st.markdown(label)
+    selected: list[str] = []
+    default_selected_set = set(default_selected)
+    for option in options:
+        checked = st.checkbox(
+            option,
+            value=option in default_selected_set,
+            key=f"{key_prefix}_{option}",
+        )
+        if checked:
+            selected.append(option)
+    return selected
+
+
+def render_fixed_retrieval_strategy(key: str) -> str:
+    return st.selectbox(
+        "Retrieval strategy",
+        options=[DEFAULT_RETRIEVAL_STRATEGY],
+        key=key,
+        help="Fixed for now. Retrieval strategy comparison is coming later.",
+    )
+
+
+def parser_result_records(runner_result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    records_by_parser: dict[str, list[dict[str, Any]]] = {}
+    for parser_id, result in runner_result.get("parser_results", {}).items():
+        answer_path = Path(str(result["answer_results"]))
+        records, error = read_jsonl(answer_path)
+        if error:
+            st.warning(error)
+            records_by_parser[str(parser_id)] = []
+        else:
+            records_by_parser[str(parser_id)] = records
+    return records_by_parser
+
+
+def render_parser_compare_results(runner_result: dict[str, Any]) -> None:
+    st.subheader("Parser Compare Results")
+    st.write(
+        {
+            "run_id": runner_result.get("run_id"),
+            "run_dir": runner_result.get("run_dir"),
+            "chroma_dir": runner_result.get("chroma_dir"),
+            "reports": runner_result.get("reports"),
+        }
+    )
+
+    records_by_parser = parser_result_records(runner_result)
+    question_ids = sorted(
+        {
+            str(record.get("question_id"))
+            for records in records_by_parser.values()
+            for record in records
+            if record.get("question_id") is not None
+        }
+    )
+    if not question_ids:
+        st.info("No answer results were found for this run.")
+        return
+
+    question_text_by_id = {
+        str(record.get("question_id")): str(record.get("question", ""))
+        for records in records_by_parser.values()
+        for record in records
+    }
+    selected_question_id = st.selectbox(
+        "Question",
+        options=question_ids,
+        format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+        key=f"parser_compare_result_question_{runner_result.get('run_id')}",
+    )
+
+    parser_ids = list(records_by_parser)
+    columns = st.columns(len(parser_ids))
+    for column, parser_id in zip(columns, parser_ids):
+        with column:
+            st.markdown(f"#### {parser_id}")
+            record = next(
+                (
+                    item
+                    for item in records_by_parser[parser_id]
+                    if str(item.get("question_id")) == selected_question_id
+                ),
+                None,
+            )
+            if record is None:
+                st.info("No result for this question.")
+                continue
+
+            st.markdown("##### Generated Answer")
+            st.markdown(str(record.get("generated_answer", "")))
+            st.markdown("##### Retrieved Chunks")
+            render_chunk_table(
+                record.get("retrieved_chunks", []),
+                "No retrieved chunks found.",
+            )
+
+
+def render_parser_compare_tab(config: dict[str, Any]) -> None:
+    st.subheader("Parser Compare")
+    st.info(
+        "Change only the document parser. Chunking strategy, embedding model, answer model, "
+        "retrieval strategy, benchmark questions, and top_k stay fixed."
+    )
+
+    embedding_options, answer_options, default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="parser_compare_pdf")
+    selected_parsers = selected_parser_ids_from_checkboxes("parser_compare_parser")
+    chunking_strategy = st.selectbox("Chunking strategy", options=["fixed-size"], key="parser_compare_chunking")
+    retrieval_strategy = render_fixed_retrieval_strategy("parser_compare_retrieval_strategy")
+    embedding_model = st.selectbox(
+        "Embedding model",
+        options=embedding_options,
+        index=default_index(embedding_options, default_embedding),
+        key="parser_compare_embedding",
+    )
+    answer_model = st.selectbox(
+        "Answer model",
+        options=answer_options,
+        index=default_index(answer_options, default_answer),
+        key="parser_compare_answer",
+    )
+    top_k = st.number_input(
+        "top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="parser_compare_top_k",
+    )
+    benchmark_questions, benchmark_questions_error = load_benchmark_questions_for_ui()
+    render_benchmark_questions_preview(benchmark_questions, benchmark_questions_error)
+
+    validation_errors = []
+    if len(selected_parsers) < 2:
+        validation_errors.append("Select at least two parsers.")
+    if benchmark_questions_error:
+        validation_errors.append(benchmark_questions_error)
+    for error in validation_errors:
+        st.warning(error)
+
+    rendered_current_results = False
+    if st.button("Run Parser Benchmark", type="primary", key="run_parser_compare"):
+        errors = validate_setup_inputs(uploaded_pdf, validation_errors)
+        if errors:
+            for error in errors:
+                st.warning(error)
+            return
+
+        run_config = setup_run_config("parser_compare", int(top_k))
+        run_config.update(
+            {
+                "selected_parsers": selected_parsers,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": retrieval_strategy,
+                "embedding_model": embedding_model,
+                "answer_model": answer_model,
+                "chunk_size": safe_int(
+                    config.get("chunking", {}).get("chunk_size"),
+                    default=800,
+                ),
+                "chunk_overlap": safe_int(
+                    config.get("chunking", {}).get("chunk_overlap"),
+                    default=150,
+                ),
+            }
+        )
+        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+        render_saved_run(run_id, run_dir, config_path, run_config)
+
+        progress_bar = st.progress(0)
+        with st.status("Running parser comparison benchmark", expanded=True) as status:
+            try:
+                from benchmark_runner import run_parser_compare
+
+                def update_progress(message: str, step: int, total: int) -> None:
+                    progress_bar.progress(step / total)
+                    st.write(message)
+
+                runner_result = run_parser_compare(
+                    config_path,
+                    progress_callback=update_progress,
+                )
+            except Exception as exc:
+                status.update(label="Parser benchmark failed", state="error")
+                st.error(f"Parser benchmark failed: {exc}")
+                return
+
+            status.update(label="Parser benchmark complete", state="complete")
+
+        st.session_state["last_parser_compare_result"] = runner_result
+        render_parser_compare_results(runner_result)
+        rendered_current_results = True
+
+    if "last_parser_compare_result" in st.session_state and not rendered_current_results:
+        with st.expander("Latest Parser Compare Results", expanded=False):
+            render_parser_compare_results(dict(st.session_state["last_parser_compare_result"]))
+
+
+def render_chunking_compare_tab(config: dict[str, Any]) -> None:
+    st.subheader("Chunking Compare")
+    st.info(
+        "Change only the chunking strategy. Parser, embedding model, answer model, "
+        "retrieval strategy, benchmark questions, and top_k stay fixed."
+    )
+
+    embedding_options, answer_options, default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="chunking_compare_pdf")
+    parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="chunking_compare_parser")
+    selected_chunking_strategies = selected_options_from_checkboxes(
+        "Chunking strategies",
+        CHUNKING_STRATEGY_OPTIONS,
+        ["fixed-size", "page-based"],
+        "chunking_compare_strategy",
+    )
+    retrieval_strategy = render_fixed_retrieval_strategy("chunking_compare_retrieval_strategy")
+    embedding_model = st.selectbox(
+        "Embedding model",
+        options=embedding_options,
+        index=default_index(embedding_options, default_embedding),
+        key="chunking_compare_embedding",
+    )
+    answer_model = st.selectbox(
+        "Answer model",
+        options=answer_options,
+        index=default_index(answer_options, default_answer),
+        key="chunking_compare_answer",
+    )
+    top_k = st.number_input(
+        "top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="chunking_compare_top_k",
+    )
+
+    validation_errors = []
+    if len(selected_chunking_strategies) < 2:
+        validation_errors.append("Select at least two chunking strategies.")
+    for error in validation_errors:
+        st.warning(error)
+
+    if st.button("Run Chunking Benchmark", type="primary", key="run_chunking_compare"):
+        errors = validate_setup_inputs(uploaded_pdf, validation_errors)
+        if errors:
+            for error in errors:
+                st.warning(error)
+            return
+
+        run_config = setup_run_config("chunking_compare", int(top_k))
+        run_config.update(
+            {
+                "parser": PARSER_ID_BY_LABEL[parser_label],
+                "selected_chunking_strategies": selected_chunking_strategies,
+                "retrieval_strategy": retrieval_strategy,
+                "embedding_model": embedding_model,
+                "answer_model": answer_model,
+            }
+        )
+        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+        render_placeholder_status()
+        render_saved_run(run_id, run_dir, config_path, run_config)
+
+
+def render_embedding_compare_tab(config: dict[str, Any]) -> None:
+    st.subheader("Embedding Compare")
+    st.info(
+        "Change only the embedding model. Parser, chunking strategy, answer model, "
+        "retrieval strategy, benchmark questions, and top_k stay fixed."
+    )
+
+    embedding_options, answer_options, _default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    default_embeddings = [
+        model for model in EMBEDDING_MODEL_OPTIONS[:2] if model in embedding_options
+    ]
+    uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="embedding_compare_pdf")
+    parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="embedding_compare_parser")
+    chunking_strategy = st.selectbox(
+        "Chunking strategy",
+        options=CHUNKING_STRATEGY_OPTIONS,
+        key="embedding_compare_chunking",
+    )
+    retrieval_strategy = render_fixed_retrieval_strategy("embedding_compare_retrieval_strategy")
+    selected_embedding_models = selected_options_from_checkboxes(
+        "Embedding models",
+        embedding_options,
+        default_embeddings,
+        "embedding_compare_model",
+    )
+    answer_model = st.selectbox(
+        "Answer model",
+        options=answer_options,
+        index=default_index(answer_options, default_answer),
+        key="embedding_compare_answer",
+    )
+    top_k = st.number_input(
+        "top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="embedding_compare_top_k",
+    )
+
+    validation_errors = []
+    if len(selected_embedding_models) < 2:
+        validation_errors.append("Select at least two embedding models.")
+    for error in validation_errors:
+        st.warning(error)
+
+    if st.button("Run Embedding Benchmark", type="primary", key="run_embedding_compare"):
+        errors = validate_setup_inputs(uploaded_pdf, validation_errors)
+        if errors:
+            for error in errors:
+                st.warning(error)
+            return
+
+        run_config = setup_run_config("embedding_compare", int(top_k))
+        run_config.update(
+            {
+                "parser": PARSER_ID_BY_LABEL[parser_label],
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": retrieval_strategy,
+                "selected_embedding_models": selected_embedding_models,
+                "answer_model": answer_model,
+            }
+        )
+        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+        render_placeholder_status()
+        render_saved_run(run_id, run_dir, config_path, run_config)
+
+
+def render_retrieval_strategy_compare_tab() -> None:
+    st.subheader("Retrieval Strategy Compare")
+    st.info(
+        "Coming soon. This will compare retrieval strategies while keeping parser, chunking, "
+        "embedding model, answer model, benchmark questions, and top_k fixed."
+    )
+    st.selectbox(
+        "Current retrieval strategy",
+        options=[DEFAULT_RETRIEVAL_STRATEGY],
+        key="retrieval_strategy_compare_current",
+        disabled=True,
+    )
+    st.button("Run Retrieval Strategy Benchmark", disabled=True)
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
+    st.caption(
+        "Configure controlled benchmark runs. This UI saves uploaded PDFs and run_config.yaml files only; "
+        "no extraction, chunking, embedding, retrieval, answer generation, or query expansion is run."
+    )
 
-    benchmark_records, benchmark_error = read_jsonl(BENCHMARK_QUESTIONS_PATH)
-    original_records, original_error = read_jsonl(ORIGINAL_RESULTS_PATH)
-    expansion_records, expansion_error = read_jsonl(QUERY_EXPANSIONS_PATH)
-    expanded_records, expanded_error = read_jsonl(EXPANDED_RESULTS_PATH)
-    docling_original_records, docling_original_error = read_jsonl(DOCLING_ORIGINAL_RESULTS_PATH)
-    docling_expanded_records, docling_expanded_error = read_jsonl(DOCLING_EXPANDED_RESULTS_PATH)
-    comparison_df, comparison_error = read_csv(COMPARISON_CSV_PATH)
-    report_markdown, report_error = read_markdown(COMPARISON_REPORT_PATH)
-    parser_comparison_df, parser_comparison_error = read_csv(PARSER_COMPARISON_CSV_PATH)
-    parser_report_markdown, parser_report_error = read_markdown(PARSER_COMPARISON_REPORT_PATH)
     config, config_error = load_config(CONFIG_PATH)
-    manual_settings, manual_config_error = manual_query_config(config) if config else ({}, None)
+    if config_error:
+        st.warning(config_error)
 
-    errors = [
-        error
-        for error in [
-            original_error,
-            expansion_error,
-            expanded_error,
-            comparison_error,
-            report_error,
-            docling_original_error,
-            docling_expanded_error,
-            parser_comparison_error,
-            parser_report_error,
-            benchmark_error,
-        ]
-        if error
-    ]
-    render_file_warnings(errors)
+    if BENCHMARK_QUESTIONS_PATH.exists():
+        st.caption(f"Benchmark questions: `{BENCHMARK_QUESTIONS_PATH}`")
+    else:
+        st.warning(f"Missing benchmark questions file: {BENCHMARK_QUESTIONS_PATH}")
 
-    benchmark_questions = benchmark_question_map(benchmark_records)
-    original_by_question = group_by_question(original_records)
-    expansions_by_question = query_expansion_map(expansion_records)
-    expanded_by_question = group_by_question(expanded_records)
-    docling_original_by_question = group_by_question(docling_original_records)
-    docling_expanded_by_question = group_by_question(docling_expanded_records)
-    question_ids = all_question_ids(original_records, expansion_records, expanded_records)
-
-    st.subheader("Overview")
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Benchmark questions", len(question_ids))
-    metric_cols[1].metric("Original retrieval records", len(original_records))
-    metric_cols[2].metric("Expanded retrieval records", len(expanded_records))
-    metric_cols[3].metric("Query expansion records", len(expansion_records))
-
-    (
-        benchmark_tool_tab,
-        details_tab,
-        manual_tab,
-        benchmark_answer_tab,
-        parser_tab,
-        comparison_tab,
-        report_tab,
-    ) = st.tabs(
+    parser_tab, chunking_tab, embedding_tab, retrieval_strategy_tab = st.tabs(
         [
-            "Benchmark Tool",
-            "Question Details",
-            "Manual Query",
-            "Benchmark Answer Comparison",
-            "Parser Comparison",
-            "Comparison CSV",
-            "Markdown Report",
+            "Parser Compare",
+            "Chunking Compare",
+            "Embedding Compare",
+            "Retrieval Strategy Compare",
         ]
     )
 
-    with benchmark_tool_tab:
-        render_benchmark_tool(config)
-
-    with details_tab:
-        if not question_ids:
-            st.info("No question records were found in the available output files.")
-        else:
-            labels = {
-                question_id: f"{question_id} - {first_question_text(question_id, original_by_question, expansions_by_question, expanded_by_question)}"
-                for question_id in question_ids
-            }
-            selected_question_id = st.selectbox(
-                "Question",
-                options=question_ids,
-                format_func=lambda question_id: labels[question_id],
-            )
-
-            original_question = first_question_text(
-                selected_question_id,
-                original_by_question,
-                expansions_by_question,
-                expanded_by_question,
-            )
-            selected_original_records = original_by_question.get(selected_question_id, [])
-            selected_expansion_record = expansions_by_question.get(selected_question_id, {})
-            selected_expanded_records = expanded_by_question.get(selected_question_id, [])
-
-            original_chunks = (
-                selected_original_records[0].get("retrieved_chunks", [])
-                if selected_original_records
-                else []
-            )
-            original_chunk_ids = {str(chunk.get("chunk_id", "")) for chunk in original_chunks}
-            expanded_chunks_by_id = unique_chunks(selected_expanded_records)
-            expanded_only_ids = set(expanded_chunks_by_id) - original_chunk_ids
-            expanded_only_chunks = [
-                chunk
-                for chunk_id, chunk in expanded_chunks_by_id.items()
-                if chunk_id in expanded_only_ids
-            ]
-
-            st.markdown("#### Original Question")
-            st.write(original_question or "No original question text found.")
-
-            st.markdown("#### Expanded Queries")
-            expanded_queries = selected_expansion_record.get("expanded_queries", [])
-            if expanded_queries:
-                for index, query in enumerate(expanded_queries, start=1):
-                    st.write(f"{index}. {query}")
-            else:
-                st.info("No expanded queries found for this question.")
-
-            left_col, right_col = st.columns(2)
-            with left_col:
-                st.markdown("#### Original Retrieved Chunks")
-                render_chunk_table(
-                    original_chunks,
-                    "No original retrieved chunks found for this question.",
-                )
-
-            with right_col:
-                st.markdown("#### Expanded-Only Chunks")
-                render_chunk_table(
-                    expanded_only_chunks,
-                    "No chunks found only by expanded queries for this question.",
-                    highlight_ids=expanded_only_ids,
-                )
-
-            st.markdown("#### Expanded Retrieved Chunks By Query")
-            if not selected_expanded_records:
-                st.info("No expanded retrieval records found for this question.")
-            else:
-                for record in sorted(
-                    selected_expanded_records,
-                    key=lambda item: safe_int(item.get("expanded_query_index")),
-                ):
-                    query_index = safe_int(record.get("expanded_query_index")) + 1
-                    query_text = str(record.get("query_text", ""))
-                    with st.expander(f"Expanded query {query_index}: {query_text}", expanded=False):
-                        render_chunk_table(
-                            record.get("retrieved_chunks", []),
-                            "No retrieved chunks found for this expanded query.",
-                            highlight_ids=expanded_only_ids,
-                        )
-
-    with manual_tab:
-        st.subheader("Manual Query")
-
-        if config_error:
-            st.warning(config_error)
-        elif manual_config_error:
-            st.warning(manual_config_error)
-        else:
-            config_cols = st.columns(3)
-            config_cols[0].caption(f"Embedding model: `{manual_settings['embedding_model_name']}`")
-            config_cols[1].caption(f"Chroma path: `{manual_settings['vector_db_dir']}`")
-            config_cols[2].caption(
-                "Collections: "
-                f"`{manual_settings['pymupdf_collection_name']}`, "
-                f"`{manual_settings['docling_collection_name']}`"
-            )
-            st.caption(
-                "Ollama expansion model: "
-                f"`{manual_settings['ollama_model_name']}` "
-                f"({manual_settings['num_expanded_queries']} queries)"
-            )
-
-            source_choice = st.selectbox(
-                "Parser/source",
-                options=["PyMuPDF baseline", "Docling structured parser", "Compare both"],
-            )
-            manual_query = st.text_area(
-                "Custom technical document question",
-                placeholder="Type a question to retrieve matching chunks from the current Chroma DB.",
-                height=120,
-            )
-            top_k = st.number_input(
-                "top_k",
-                min_value=1,
-                max_value=50,
-                value=manual_settings["top_k"],
-                step=1,
-                key="manual_query_top_k",
-            )
-            use_query_expansion = st.checkbox("Use Ollama query expansion")
-
-            if st.button("Search", type="primary"):
-                query_text = manual_query.strip()
-                if not query_text:
-                    st.warning("Enter a query before searching.")
-                elif not Path(manual_settings["vector_db_dir"]).exists():
-                    st.warning(f"Chroma DB path does not exist: {manual_settings['vector_db_dir']}")
-                else:
-                    try:
-                        source_options = manual_source_options(manual_settings)
-                        selected_sources = (
-                            list(source_options.items())
-                            if source_choice == "Compare both"
-                            else [(source_choice, source_options[source_choice])]
-                        )
-
-                        expanded_queries: list[str] = []
-                        if use_query_expansion:
-                            with st.spinner("Generating expanded queries with Ollama..."):
-                                expanded_queries = expand_manual_query(query_text, manual_settings)
-
-                        manual_results: dict[str, dict[str, Any]] = {}
-                        for label, source_config in selected_sources:
-                            with st.spinner(f"Retrieving chunks from {label}..."):
-                                original_chunks = retrieve_manual_query(
-                                    query_text=query_text,
-                                    top_k=int(top_k),
-                                    settings=manual_settings,
-                                    collection_name=source_config["collection_name"],
-                                    source=source_config["source"],
-                                )
-
-                                expanded_records: list[dict[str, Any]] = []
-                                if use_query_expansion:
-                                    for index, expanded_query in enumerate(expanded_queries):
-                                        expanded_records.append(
-                                            {
-                                                "query_text": expanded_query,
-                                                "expanded_query_index": index,
-                                                "retrieved_chunks": retrieve_manual_query(
-                                                    query_text=expanded_query,
-                                                    top_k=int(top_k),
-                                                    settings=manual_settings,
-                                                    collection_name=source_config["collection_name"],
-                                                    source=source_config["source"],
-                                                ),
-                                            }
-                                        )
-
-                            manual_results[label] = {
-                                "original_chunks": original_chunks,
-                                "expanded_records": expanded_records,
-                                "collection_name": source_config["collection_name"],
-                            }
-                        st.session_state["manual_query_text"] = query_text
-                        st.session_state["manual_results"] = manual_results
-                        st.session_state["manual_source_choice"] = source_choice
-                        st.session_state["manual_use_query_expansion"] = use_query_expansion
-                        st.session_state["manual_expanded_queries"] = expanded_queries
-                        for key in list(st.session_state):
-                            if str(key).startswith("manual_answer_"):
-                                del st.session_state[key]
-                    except Exception as exc:
-                        st.error(f"Manual retrieval failed: {exc}")
-                    else:
-                        st.success("Retrieval complete.")
-
-            if "manual_results" in st.session_state:
-                render_manual_query_results(
-                    source_choice=str(st.session_state["manual_source_choice"]),
-                    use_query_expansion=bool(st.session_state["manual_use_query_expansion"]),
-                    expanded_queries=list(st.session_state["manual_expanded_queries"]),
-                    manual_results=dict(st.session_state["manual_results"]),
-                    query_text=str(st.session_state["manual_query_text"]),
-                    settings=manual_settings,
-                )
-
-    with benchmark_answer_tab:
-        st.subheader("Benchmark Answer Comparison")
-        st.caption(
-            "Neutral comparison of answers generated from existing retrieval outputs."
-        )
-
-        if config_error:
-            st.warning(config_error)
-        elif manual_config_error:
-            st.warning(manual_config_error)
-        elif not benchmark_questions:
-            st.info("No benchmark questions were found.")
-        else:
-            benchmark_question_ids = sorted(benchmark_questions)
-            selected_benchmark_question_id = st.selectbox(
-                "Benchmark question",
-                options=benchmark_question_ids,
-                format_func=lambda question_id: f"{question_id} - {benchmark_questions[question_id]}",
-                key="benchmark_answer_question",
-            )
-            selected_benchmark_question = benchmark_questions[selected_benchmark_question_id]
-
-            st.write(
-                {
-                    "question_id": selected_benchmark_question_id,
-                    "question": selected_benchmark_question,
-                }
-            )
-
-            top_k = manual_settings["top_k"]
-            answer_contexts = {
-                "PyMuPDF Original": original_answer_chunks(
-                    original_by_question,
-                    selected_benchmark_question_id,
-                    source="pymupdf",
-                    top_k=top_k,
-                ),
-                "PyMuPDF Expanded": expanded_answer_chunks(
-                    expanded_by_question,
-                    selected_benchmark_question_id,
-                    source="pymupdf",
-                    top_k=top_k,
-                ),
-                "Docling Original": original_answer_chunks(
-                    docling_original_by_question,
-                    selected_benchmark_question_id,
-                    source="docling",
-                    top_k=top_k,
-                ),
-                "Docling Expanded": expanded_answer_chunks(
-                    docling_expanded_by_question,
-                    selected_benchmark_question_id,
-                    source="docling",
-                    top_k=top_k,
-                ),
-            }
-
-            context_cols = st.columns(4)
-            for column, (label, chunks) in zip(context_cols, answer_contexts.items()):
-                column.metric(label, len(chunks))
-
-            if st.button("Generate Answers for Selected Question", type="primary"):
-                answer_key = f"benchmark_answers_{selected_benchmark_question_id}"
-                try:
-                    generated_answers: dict[str, str] = {}
-                    for label, chunks in answer_contexts.items():
-                        with st.spinner(f"Generating answer: {label}..."):
-                            generated_answers[label] = generate_grounded_answer(
-                                query_text=selected_benchmark_question,
-                                chunks=chunks,
-                                settings=manual_settings,
-                            )
-                    st.session_state[answer_key] = generated_answers
-                except Exception as exc:
-                    st.error(f"Benchmark answer generation failed: {exc}")
-
-            answers = st.session_state.get(
-                f"benchmark_answers_{selected_benchmark_question_id}",
-                {},
-            )
-
-            first_row = st.columns(2)
-            second_row = st.columns(2)
-            panels = list(answer_contexts.items())
-            for column, (label, chunks) in zip(first_row + second_row, panels):
-                with column:
-                    render_answer_panel(
-                        title=label,
-                        answer=answers.get(label),
-                        chunks=chunks,
-                    )
-
-            render_manual_review_checklist()
-
     with parser_tab:
-        st.subheader("Parser Comparison")
-        st.caption(
-            "Neutral side-by-side view of existing PyMuPDF and Docling retrieval outputs."
-        )
+        render_parser_compare_tab(config)
 
-        parser_question_ids = comparison_question_ids(
-            parser_comparison_df,
-            original_by_question,
-            docling_original_by_question,
-            expanded_by_question,
-            docling_expanded_by_question,
-        )
+    with chunking_tab:
+        render_chunking_compare_tab(config)
 
-        total_pymupdf_only = (
-            int(parser_comparison_df["pymupdf_only_count"].sum())
-            if not parser_comparison_df.empty and "pymupdf_only_count" in parser_comparison_df
-            else 0
-        )
-        total_docling_only = (
-            int(parser_comparison_df["docling_only_count"].sum())
-            if not parser_comparison_df.empty and "docling_only_count" in parser_comparison_df
-            else 0
-        )
-        total_overlap = (
-            int(parser_comparison_df["overlap_count"].sum())
-            if not parser_comparison_df.empty and "overlap_count" in parser_comparison_df
-            else 0
-        )
+    with embedding_tab:
+        render_embedding_compare_tab(config)
 
-        parser_metric_cols = st.columns(4)
-        parser_metric_cols[0].metric("Questions compared", len(parser_question_ids))
-        parser_metric_cols[1].metric("PyMuPDF-only chunks", total_pymupdf_only)
-        parser_metric_cols[2].metric("Docling-only chunks", total_docling_only)
-        parser_metric_cols[3].metric("Overlap", total_overlap)
-
-        if not parser_question_ids:
-            st.info("No parser comparison records were found.")
-        else:
-            selected_parser_question_id = st.selectbox(
-                "Parser comparison question",
-                options=parser_question_ids,
-                format_func=lambda question_id: question_label(
-                    question_id,
-                    parser_comparison_df,
-                    original_by_question,
-                    docling_original_by_question,
-                    expanded_by_question,
-                    docling_expanded_by_question,
-                ),
-            )
-
-            selected_rows = (
-                parser_comparison_df[
-                    parser_comparison_df["question_id"].astype(str) == selected_parser_question_id
-                ]
-                if not parser_comparison_df.empty and "question_id" in parser_comparison_df.columns
-                else pd.DataFrame()
-            )
-            selected_row = selected_rows.iloc[0] if not selected_rows.empty else None
-
-            question_cols = st.columns(4)
-            question_cols[0].metric(
-                "PyMuPDF unique",
-                parser_metric_value(selected_row, "pymupdf_unique_chunk_count"),
-            )
-            question_cols[1].metric(
-                "Docling unique",
-                parser_metric_value(selected_row, "docling_unique_chunk_count"),
-            )
-            question_cols[2].metric(
-                "PyMuPDF only",
-                parser_metric_value(selected_row, "pymupdf_only_count"),
-            )
-            question_cols[3].metric(
-                "Docling only",
-                parser_metric_value(selected_row, "docling_only_count"),
-            )
-
-            if selected_row is not None:
-                st.write(
-                    {
-                        "overlap_count": parser_metric_value(selected_row, "overlap_count"),
-                        "top_pymupdf_pages": selected_row.get("top_pymupdf_pages", ""),
-                        "top_docling_pages": selected_row.get("top_docling_pages", ""),
-                        "top_docling_section_titles": selected_row.get(
-                            "top_docling_section_titles",
-                            "",
-                        ),
-                    }
-                )
-
-            pymupdf_original_record = first_original_record(
-                original_by_question.get(selected_parser_question_id, [])
-            )
-            docling_original_record = first_original_record(
-                docling_original_by_question.get(selected_parser_question_id, [])
-            )
-            pymupdf_expanded_records = expanded_by_question.get(selected_parser_question_id, [])
-            selected_docling_expanded_records = docling_expanded_by_question.get(
-                selected_parser_question_id,
-                [],
-            )
-
-            original_cols = st.columns(2)
-            with original_cols[0]:
-                st.markdown("#### PyMuPDF Original Retrieval")
-                render_chunk_table(
-                    pymupdf_original_record.get("retrieved_chunks", [])
-                    if pymupdf_original_record
-                    else [],
-                    "No PyMuPDF original retrieval chunks found for this question.",
-                )
-            with original_cols[1]:
-                st.markdown("#### Docling Original Retrieval")
-                render_chunk_table(
-                    docling_original_record.get("retrieved_chunks", [])
-                    if docling_original_record
-                    else [],
-                    "No Docling original retrieval chunks found for this question.",
-                )
-
-            expanded_cols = st.columns(2)
-            with expanded_cols[0]:
-                st.markdown("#### PyMuPDF Expanded Retrieval")
-                render_expanded_records(
-                    pymupdf_expanded_records,
-                    "No PyMuPDF expanded retrieval records found for this question.",
-                )
-            with expanded_cols[1]:
-                st.markdown("#### Docling Expanded Retrieval")
-                render_expanded_records(
-                    selected_docling_expanded_records,
-                    "No Docling expanded retrieval records found for this question.",
-                )
-
-        with st.expander("Parser Comparison Report", expanded=False):
-            if parser_report_markdown:
-                st.markdown(parser_report_markdown)
-            else:
-                st.info("No parser comparison report available.")
-
-    with comparison_tab:
-        st.subheader("Retrieval Comparison CSV")
-        if comparison_df.empty:
-            st.info("No comparison CSV data available.")
-        else:
-            st.dataframe(comparison_df, hide_index=True, use_container_width=True)
-
-    with report_tab:
-        st.subheader("Retrieval Comparison Report")
-        if report_markdown:
-            st.markdown(report_markdown)
-        else:
-            st.info("No Markdown report available.")
-
-    with st.sidebar:
-        st.header("Expected Files")
-        for path in EXPECTED_FILES:
-            status = "Found" if path.exists() else "Missing"
-            st.write(f"{status}: `{path}`")
+    with retrieval_strategy_tab:
+        render_retrieval_strategy_compare_tab()
 
 
 if __name__ == "__main__":
