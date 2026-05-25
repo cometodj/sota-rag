@@ -1471,6 +1471,97 @@ def render_parser_compare_results(runner_result: dict[str, Any]) -> None:
             )
 
 
+def chunking_result_records(runner_result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    records_by_strategy: dict[str, list[dict[str, Any]]] = {}
+    for strategy, result in runner_result.get("strategy_results", {}).items():
+        answer_path = Path(str(result["answer_results"]))
+        records, error = read_jsonl(answer_path)
+        if error:
+            st.warning(error)
+            records_by_strategy[str(strategy)] = []
+        else:
+            records_by_strategy[str(strategy)] = records
+    return records_by_strategy
+
+
+def render_chunking_compare_results(runner_result: dict[str, Any]) -> None:
+    st.subheader("Chunking Compare Results")
+    st.write(
+        {
+            "run_id": runner_result.get("run_id"),
+            "run_dir": runner_result.get("run_dir"),
+            "chroma_dir": runner_result.get("chroma_dir"),
+            "parser": runner_result.get("parser"),
+            "reports": runner_result.get("reports"),
+        }
+    )
+
+    strategy_results = dict(runner_result.get("strategy_results", {}))
+    warnings = {
+        strategy: result.get("warnings", [])
+        for strategy, result in strategy_results.items()
+        if result.get("warnings")
+    }
+    if warnings:
+        st.warning("Some chunking strategies emitted warnings.")
+        st.write(warnings)
+
+    records_by_strategy = chunking_result_records(runner_result)
+    question_ids = sorted(
+        {
+            str(record.get("question_id"))
+            for records in records_by_strategy.values()
+            for record in records
+            if record.get("question_id") is not None
+        }
+    )
+    if not question_ids:
+        st.info("No answer results were found for this run.")
+        return
+
+    question_text_by_id = {
+        str(record.get("question_id")): str(record.get("question", ""))
+        for records in records_by_strategy.values()
+        for record in records
+    }
+    selected_question_id = st.selectbox(
+        "Question",
+        options=question_ids,
+        format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+        key=f"chunking_compare_result_question_{runner_result.get('run_id')}",
+    )
+
+    strategies = list(records_by_strategy)
+    columns = st.columns(len(strategies))
+    for column, strategy in zip(columns, strategies):
+        with column:
+            result = strategy_results.get(strategy, {})
+            st.markdown(f"#### {strategy}")
+            st.caption(
+                f"Chunks: {result.get('chunk_count', 0)} | "
+                f"Avg length: {float(result.get('average_chunk_length', 0.0)):.1f}"
+            )
+            record = next(
+                (
+                    item
+                    for item in records_by_strategy[strategy]
+                    if str(item.get("question_id")) == selected_question_id
+                ),
+                None,
+            )
+            if record is None:
+                st.info("No result for this question.")
+                continue
+
+            st.markdown("##### Generated Answer")
+            st.markdown(str(record.get("generated_answer", "")))
+            st.markdown("##### Retrieved Chunks")
+            render_chunk_table(
+                record.get("retrieved_chunks", []),
+                "No retrieved chunks found.",
+            )
+
+
 def render_parser_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Parser Compare")
     st.info(
@@ -1609,13 +1700,18 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
         step=1,
         key="chunking_compare_top_k",
     )
+    benchmark_questions, benchmark_questions_error = load_benchmark_questions_for_ui()
+    render_benchmark_questions_preview(benchmark_questions, benchmark_questions_error)
 
     validation_errors = []
     if len(selected_chunking_strategies) < 2:
         validation_errors.append("Select at least two chunking strategies.")
+    if benchmark_questions_error:
+        validation_errors.append(benchmark_questions_error)
     for error in validation_errors:
         st.warning(error)
 
+    rendered_current_results = False
     if st.button("Run Chunking Benchmark", type="primary", key="run_chunking_compare"):
         errors = validate_setup_inputs(uploaded_pdf, validation_errors)
         if errors:
@@ -1631,11 +1727,46 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
                 "retrieval_strategy": retrieval_strategy,
                 "embedding_model": embedding_model,
                 "answer_model": answer_model,
+                "chunk_size": safe_int(
+                    config.get("chunking", {}).get("chunk_size"),
+                    default=800,
+                ),
+                "chunk_overlap": safe_int(
+                    config.get("chunking", {}).get("chunk_overlap"),
+                    default=150,
+                ),
             }
         )
         run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
-        render_placeholder_status()
         render_saved_run(run_id, run_dir, config_path, run_config)
+
+        progress_bar = st.progress(0)
+        with st.status("Running chunking comparison benchmark", expanded=True) as status:
+            try:
+                from benchmark_runner import run_chunking_compare
+
+                def update_progress(message: str, step: int, total: int) -> None:
+                    progress_bar.progress(step / total)
+                    st.write(message)
+
+                runner_result = run_chunking_compare(
+                    config_path,
+                    progress_callback=update_progress,
+                )
+            except Exception as exc:
+                status.update(label="Chunking benchmark failed", state="error")
+                st.error(f"Chunking benchmark failed: {exc}")
+                return
+
+            status.update(label="Chunking benchmark complete", state="complete")
+
+        st.session_state["last_chunking_compare_result"] = runner_result
+        render_chunking_compare_results(runner_result)
+        rendered_current_results = True
+
+    if "last_chunking_compare_result" in st.session_state and not rendered_current_results:
+        with st.expander("Latest Chunking Compare Results", expanded=False):
+            render_chunking_compare_results(dict(st.session_state["last_chunking_compare_result"]))
 
 
 def render_embedding_compare_tab(config: dict[str, Any]) -> None:

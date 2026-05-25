@@ -15,6 +15,7 @@ import yaml
 
 BATCH_SIZE = 128
 SUPPORTED_PARSERS = {"pymupdf", "docling"}
+SUPPORTED_CHUNKING_STRATEGIES = {"fixed-size", "page-based", "section-aware"}
 ProgressCallback = Callable[[str, int, int], None]
 
 
@@ -87,6 +88,19 @@ def text_identity(value: str) -> str:
 def make_collection_name(parser_id: str, embedding_model_name: str, run_id: str) -> str:
     digest = hashlib.sha1(f"{parser_id}|{embedding_model_name}|{run_id}".encode("utf-8")).hexdigest()
     return f"{slugify(parser_id)[:16]}_{digest[:16]}"
+
+
+def make_strategy_collection_name(
+    run_id: str,
+    parser_id: str,
+    chunking_strategy: str,
+    embedding_model_name: str,
+) -> str:
+    embedding_slug = slugify(embedding_model_name.split("/")[-1])
+    strategy_slug = slugify(chunking_strategy)
+    base = f"{slugify(run_id)[:18]}__{slugify(parser_id)}__{strategy_slug}__{embedding_slug}"
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+    return f"{base[:54].strip('_')}_{digest}"
 
 
 def batch_records(records: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
@@ -226,6 +240,31 @@ def retrieve_questions(
     return records
 
 
+def empty_retrieval_records(
+    questions: list[dict[str, str]],
+    run_id: str,
+    experiment_type: str,
+    parser_id: str,
+    chunking_strategy: str,
+    embedding_model_name: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "run_id": run_id,
+            "experiment_type": experiment_type,
+            "parser": parser_id,
+            "chunking_strategy": chunking_strategy,
+            "embedding_model": embedding_model_name,
+            "question_id": question["id"],
+            "question": question["question"],
+            "top_k": top_k,
+            "retrieved_chunks": [],
+        }
+        for question in questions
+    ]
+
+
 def evidence_label(chunk: dict[str, Any]) -> str:
     parts = [
         f"chunk_id={chunk.get('chunk_id', '')}",
@@ -311,6 +350,229 @@ def generate_answers(
             }
         )
     return answers
+
+
+def extract_document(
+    parser_id: str,
+    pdf_path: Path,
+    extraction_dir: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    extraction_dir.mkdir(parents=True, exist_ok=True)
+    warnings: list[str] = []
+
+    if parser_id == "pymupdf":
+        from ingest import extract_pdf_pages
+
+        extracted = extract_pdf_pages(pdf_path)
+        write_jsonl(extracted, extraction_dir / "extracted.jsonl")
+        return extracted, warnings
+
+    if parser_id == "docling":
+        from ingest_docling import convert_pdf_to_markdown, markdown_sections
+
+        markdown = convert_pdf_to_markdown(pdf_path)
+        extracted = markdown_sections(markdown, document_name=pdf_path.name)
+        write_jsonl(extracted, extraction_dir / "extracted.jsonl")
+        (extraction_dir / "document.md").write_text(markdown, encoding="utf-8")
+        if not any(record.get("section_title") for record in extracted):
+            warnings.append("Docling extraction did not include section titles.")
+        return extracted, warnings
+
+    raise ValueError(f"Unsupported parser for runner: {parser_id}")
+
+
+def chunk_id_base(document_name: str, chunking_strategy: str, chunk_index: int) -> str:
+    return f"{document_name}:{slugify(chunking_strategy)}:c{chunk_index:04d}"
+
+
+def chunk_record(
+    source_record: dict[str, Any],
+    text: str,
+    chunking_strategy: str,
+    chunk_index: int,
+    offset: int = 0,
+) -> dict[str, Any]:
+    document_name = str(source_record["document_name"])
+    chunk: dict[str, Any] = {
+        "chunk_id": f"{chunk_id_base(document_name, chunking_strategy, chunk_index)}:s{offset:04d}",
+        "document_name": document_name,
+        "chunk_index": chunk_index,
+        "text": text,
+        "char_count": len(text),
+        "chunking_strategy": chunking_strategy,
+    }
+    if source_record.get("page_number") not in (None, ""):
+        chunk["page_number"] = int(source_record["page_number"])
+    if source_record.get("section_title"):
+        chunk["section_title"] = str(source_record["section_title"])
+    if source_record.get("source"):
+        chunk["source"] = str(source_record["source"])
+    return chunk
+
+
+def create_page_based_chunks(
+    extracted_records: list[dict[str, Any]],
+    chunk_size: int,
+    chunk_overlap: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    from chunking import split_text
+
+    chunks: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    if not any(record.get("page_number") for record in extracted_records):
+        warnings.append("Page numbers were unavailable; page-based chunking used extracted records as page-like units.")
+
+    for record in extracted_records:
+        text = str(record.get("text", "")).strip()
+        if not text:
+            continue
+        text_chunks = [text] if len(text) <= chunk_size else split_text(text, chunk_size, chunk_overlap)
+        for offset, chunk_text in enumerate(text_chunks):
+            chunks.append(
+                chunk_record(
+                    record,
+                    chunk_text,
+                    chunking_strategy="page-based",
+                    chunk_index=len(chunks),
+                    offset=offset,
+                )
+            )
+    return chunks, warnings
+
+
+def looks_like_heading(line: str) -> bool:
+    text = line.strip()
+    if len(text) < 3 or len(text) > 120:
+        return False
+    if text.endswith((".", ",", ";", ":")) and not re.match(r"^\d+(\.\d+)*\s+\S+", text):
+        return False
+    if re.match(r"^\d+(\.\d+)*\s+\S+", text):
+        return True
+    letters = [character for character in text if character.isalpha()]
+    if len(letters) >= 3 and sum(character.isupper() for character in letters) / len(letters) > 0.65:
+        return True
+    words = text.split()
+    return 1 <= len(words) <= 10 and text.istitle()
+
+
+def pymupdf_section_records(extracted_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    section_records: list[dict[str, Any]] = []
+    for page in extracted_records:
+        current_title: str | None = None
+        current_lines: list[str] = []
+
+        def append_current() -> None:
+            text = "\n".join(current_lines).strip()
+            if not text or current_title is None:
+                return
+            section_records.append(
+                {
+                    "document_name": page["document_name"],
+                    "page_number": page.get("page_number"),
+                    "section_title": current_title,
+                    "text": text,
+                    "char_count": len(text),
+                    "source": "pymupdf",
+                }
+            )
+
+        for line in str(page.get("text", "")).splitlines():
+            if looks_like_heading(line):
+                append_current()
+                current_title = line.strip()
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+        append_current()
+    return section_records
+
+
+def create_section_aware_chunks(
+    parser_id: str,
+    extracted_records: list[dict[str, Any]],
+    chunk_size: int,
+    chunk_overlap: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    from chunking import split_text
+
+    warnings: list[str] = []
+    section_records = extracted_records
+    if parser_id == "pymupdf":
+        section_records = pymupdf_section_records(extracted_records)
+        if not section_records:
+            warnings.append("Section-aware chunking fell back to fixed-size because PyMuPDF headings were unavailable.")
+            chunks, fallback_warnings = create_chunks_for_strategy(
+                parser_id,
+                extracted_records,
+                "fixed-size",
+                chunk_size,
+                chunk_overlap,
+                force_strategy_name="section-aware",
+            )
+            return chunks, warnings + fallback_warnings
+    elif not any(record.get("section_title") for record in extracted_records):
+        warnings.append("Section-aware chunking fell back to fixed-size because section titles were unavailable.")
+        chunks, fallback_warnings = create_chunks_for_strategy(
+            parser_id,
+            extracted_records,
+            "fixed-size",
+            chunk_size,
+            chunk_overlap,
+            force_strategy_name="section-aware",
+        )
+        return chunks, warnings + fallback_warnings
+
+    chunks: list[dict[str, Any]] = []
+    for record in section_records:
+        text = str(record.get("text", "")).strip()
+        if not text:
+            continue
+        for offset, chunk_text in enumerate(split_text(text, chunk_size, chunk_overlap)):
+            chunks.append(
+                chunk_record(
+                    record,
+                    chunk_text,
+                    chunking_strategy="section-aware",
+                    chunk_index=len(chunks),
+                    offset=offset,
+                )
+            )
+    return chunks, warnings
+
+
+def create_chunks_for_strategy(
+    parser_id: str,
+    extracted_records: list[dict[str, Any]],
+    chunking_strategy: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    force_strategy_name: str | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    output_strategy = force_strategy_name or chunking_strategy
+    warnings: list[str] = []
+
+    if chunking_strategy == "fixed-size":
+        if parser_id == "pymupdf":
+            from chunking import create_chunks as create_pymupdf_chunks
+
+            chunks = create_pymupdf_chunks(extracted_records, chunk_size, chunk_overlap)
+        else:
+            from chunking_docling import create_chunks as create_docling_chunks
+
+            chunks = create_docling_chunks(extracted_records, chunk_size, chunk_overlap)
+        for index, chunk in enumerate(chunks):
+            chunk["chunk_id"] = f"{chunk['document_name']}:{slugify(output_strategy)}:c{index:04d}"
+            chunk["chunk_index"] = index
+            chunk["chunking_strategy"] = output_strategy
+        return chunks, warnings
+
+    if chunking_strategy == "page-based":
+        return create_page_based_chunks(extracted_records, chunk_size, chunk_overlap)
+
+    if chunking_strategy == "section-aware":
+        return create_section_aware_chunks(parser_id, extracted_records, chunk_size, chunk_overlap)
+
+    raise ValueError(f"Unsupported chunking strategy: {chunking_strategy}")
 
 
 def extract_and_chunk(
@@ -462,6 +724,151 @@ def write_comparison_report(
     return csv_path, report_path
 
 
+def average_chunk_length(chunks: list[dict[str, Any]]) -> float:
+    if not chunks:
+        return 0.0
+    return sum(int(chunk.get("char_count", len(str(chunk.get("text", ""))))) for chunk in chunks) / len(chunks)
+
+
+def retrieved_locations(chunks: list[dict[str, Any]]) -> str:
+    pages = sorted(
+        {
+            str(chunk.get("page_number"))
+            for chunk in chunks
+            if chunk.get("page_number") not in (None, "")
+        }
+    )
+    sections = sorted(
+        {
+            str(chunk.get("section_title"))
+            for chunk in chunks
+            if chunk.get("section_title")
+        }
+    )
+    parts: list[str] = []
+    if pages:
+        parts.append(f"pages={', '.join(pages)}")
+    if sections:
+        parts.append(f"sections={', '.join(sections[:8])}")
+    return "; ".join(parts)
+
+
+def write_chunking_comparison_report(
+    run_dir: Path,
+    questions: list[dict[str, str]],
+    strategy_results: dict[str, dict[str, Any]],
+) -> tuple[Path, Path]:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = reports_dir / "chunking_comparison.csv"
+    report_path = reports_dir / "chunking_comparison_report.md"
+    strategies = list(strategy_results)
+
+    retrieval_by_strategy = {
+        strategy: {
+            str(record["question_id"]): record
+            for record in result["retrieval_records"]
+        }
+        for strategy, result in strategy_results.items()
+    }
+    answers_by_strategy = {
+        strategy: {
+            str(record["question_id"]): record
+            for record in result["answer_records"]
+        }
+        for strategy, result in strategy_results.items()
+    }
+
+    rows: list[dict[str, Any]] = []
+    for question in questions:
+        question_id = question["id"]
+        for strategy in strategies:
+            result = strategy_results[strategy]
+            retrieval_record = retrieval_by_strategy[strategy].get(question_id, {})
+            answer_record = answers_by_strategy[strategy].get(question_id, {})
+            retrieved_chunks = retrieval_record.get("retrieved_chunks", [])
+            rows.append(
+                {
+                    "question_id": question_id,
+                    "question": question["question"],
+                    "chunking_strategy": strategy,
+                    "chunk_count": result["chunk_count"],
+                    "average_chunk_length": f"{result['average_chunk_length']:.2f}",
+                    "retrieved_chunk_count": len(retrieved_chunks),
+                    "retrieved_locations": retrieved_locations(retrieved_chunks),
+                    "answer_preview": preview_text(str(answer_record.get("generated_answer", ""))),
+                    "warnings": " | ".join(result.get("warnings", [])),
+                }
+            )
+
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        fieldnames = [
+            "question_id",
+            "question",
+            "chunking_strategy",
+            "chunk_count",
+            "average_chunk_length",
+            "retrieved_chunk_count",
+            "retrieved_locations",
+            "answer_preview",
+            "warnings",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    lines = [
+        "# Chunking Comparison Benchmark Report",
+        "",
+        "## Summary",
+        "",
+        f"- Questions compared: {len(questions)}",
+        f"- Chunking strategies compared: {', '.join(strategies)}",
+        "",
+        "This report is neutral and does not automatically claim one chunking strategy is better.",
+        "",
+        "## Strategy Warnings",
+    ]
+    for strategy in strategies:
+        warnings = strategy_results[strategy].get("warnings", [])
+        if warnings:
+            lines.append(f"- {strategy}: {' | '.join(warnings)}")
+        else:
+            lines.append(f"- {strategy}: none")
+
+    lines.extend(["", "## Per-Question Comparison"])
+    for question in questions:
+        lines.extend(["", f"### {question['id']}", "", f"Question: {question['question']}"])
+        for row in [item for item in rows if item["question_id"] == question["id"]]:
+            lines.extend(
+                [
+                    "",
+                    f"#### {row['chunking_strategy']}",
+                    "",
+                    f"- Chunks generated: {row['chunk_count']}",
+                    f"- Average chunk length: {row['average_chunk_length']}",
+                    f"- Retrieved chunks: {row['retrieved_chunk_count']}",
+                    f"- Retrieved pages or sections: {row['retrieved_locations'] or 'none'}",
+                    f"- Answer preview: {row['answer_preview']}",
+                    f"- Warnings: {row['warnings'] or 'none'}",
+                ]
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Manual Review Notes",
+            "",
+            "- Review whether each answer is grounded in the retrieved chunks.",
+            "- Check whether chunk boundaries preserve table rows, field names, and section context.",
+            "- Compare retrieved pages or sections without treating overlap as an automatic quality score.",
+            "- Do not use this report as an automatic chunking strategy recommendation.",
+        ]
+    )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, report_path
+
+
 def run_parser_compare(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
@@ -570,20 +977,15 @@ def run_parser_compare(
     for parser_id, collection in collections_by_parser.items():
         parser_dir = run_dir / parser_id
         if not chunks_by_parser[parser_id]:
-            retrieval_records = [
-                {
-                    "run_id": run_id,
-                    "experiment_type": experiment_type,
-                    "parser": parser_id,
-                    "chunking_strategy": chunking_strategy,
-                    "embedding_model": embedding_model_name,
-                    "question_id": question["id"],
-                    "question": question["question"],
-                    "top_k": top_k,
-                    "retrieved_chunks": [],
-                }
-                for question in questions
-            ]
+            retrieval_records = empty_retrieval_records(
+                questions,
+                run_id,
+                experiment_type,
+                parser_id,
+                chunking_strategy,
+                embedding_model_name,
+                top_k,
+            )
         else:
             retrieval_records = retrieve_questions(
                 questions=questions,
@@ -643,6 +1045,205 @@ def run_parser_comparison(
     return run_parser_compare(run_config_path, progress_callback=progress_callback)
 
 
+def run_chunking_compare(
+    run_config_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    config_path = Path(run_config_path)
+    run_config = read_yaml(config_path)
+    run_dir = config_path.parent
+    pdf_path = Path(run_config.get("uploaded_pdf_path") or run_config["pdf"]["saved_path"])
+    questions_config = run_config.get("benchmark_questions", {})
+    questions_path = Path(
+        run_config.get("benchmark_questions_path")
+        or questions_config.get("saved_path")
+        or questions_config["path"]
+    )
+
+    experiment_type = str(run_config.get("experiment_type", "chunking_compare"))
+    if experiment_type != "chunking_compare":
+        raise ValueError(f"run_chunking_compare only supports experiment_type=chunking_compare: {experiment_type}")
+
+    parser_id = str(run_config["parser"])
+    if parser_id not in SUPPORTED_PARSERS:
+        raise ValueError(f"Unsupported parser for runner: {parser_id}")
+
+    selected_strategies = [
+        str(strategy)
+        for strategy in run_config.get("selected_chunking_strategies", [])
+    ]
+    unsupported = sorted(set(selected_strategies) - SUPPORTED_CHUNKING_STRATEGIES)
+    if unsupported:
+        raise ValueError(f"Unsupported chunking strategy/strategies: {unsupported}")
+    if len(selected_strategies) < 2:
+        raise ValueError("Chunking Compare requires at least two selected chunking strategies.")
+
+    retrieval_strategy = str(run_config.get("retrieval_strategy", "dense_vector"))
+    if retrieval_strategy != "dense_vector":
+        raise ValueError(
+            "Chunking Compare runner currently supports only retrieval_strategy='dense_vector'. "
+            f"Received: {retrieval_strategy}"
+        )
+
+    run_id = str(run_config["run_id"])
+    embedding_model_name = str(run_config["embedding_model"])
+    answer_model = str(run_config["answer_model"])
+    top_k = int(run_config["top_k"])
+    chunk_size = int(run_config.get("chunk_size", 800))
+    chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    questions = read_benchmark_questions(questions_path)
+    chroma_dir = run_dir / "chroma"
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(chroma_dir))
+    embedding_model = BenchmarkEmbeddingModel(embedding_model_name)
+    strategy_results: dict[str, dict[str, Any]] = {}
+
+    total_steps = 7
+    step = 0
+
+    def progress(message: str) -> None:
+        nonlocal step
+        step += 1
+        if progress_callback:
+            progress_callback(message, step, total_steps)
+        else:
+            print(f"[{step}/{total_steps}] {message}")
+
+    progress("Preparing run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    progress("Extracting document")
+    extracted_records, extraction_warnings = extract_document(parser_id, pdf_path, run_dir / "extraction")
+
+    progress("Running chunking strategies")
+    chunks_by_strategy: dict[str, list[dict[str, Any]]] = {}
+    warnings_by_strategy: dict[str, list[str]] = {}
+    for strategy in selected_strategies:
+        strategy_dir = run_dir / strategy
+        strategy_dir.mkdir(parents=True, exist_ok=True)
+        chunks, warnings = create_chunks_for_strategy(
+            parser_id,
+            extracted_records,
+            strategy,
+            chunk_size,
+            chunk_overlap,
+        )
+        warnings = extraction_warnings + warnings
+        chunks_by_strategy[strategy] = chunks
+        warnings_by_strategy[strategy] = warnings
+        write_jsonl(chunks, strategy_dir / "chunks.jsonl")
+
+    progress("Building vector DBs")
+    collections_by_strategy: dict[str, Any] = {}
+    collection_names_by_strategy: dict[str, str] = {}
+    for strategy, chunks in chunks_by_strategy.items():
+        collection_name = make_strategy_collection_name(
+            run_id=run_id,
+            parser_id=parser_id,
+            chunking_strategy=strategy,
+            embedding_model_name=embedding_model_name,
+        )
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={
+                "parser": parser_id,
+                "embedding_model": embedding_model_name,
+                "chunking_strategy": strategy,
+                "retrieval_strategy": retrieval_strategy,
+            },
+        )
+        if chunks:
+            index_chunks(chunks, collection, embedding_model, parser_id)
+        collections_by_strategy[strategy] = collection
+        collection_names_by_strategy[strategy] = collection_name
+
+    progress("Running retrieval")
+    for strategy, collection in collections_by_strategy.items():
+        strategy_dir = run_dir / strategy
+        if not chunks_by_strategy[strategy]:
+            retrieval_records = empty_retrieval_records(
+                questions,
+                run_id,
+                experiment_type,
+                parser_id,
+                strategy,
+                embedding_model_name,
+                top_k,
+            )
+        else:
+            retrieval_records = retrieve_questions(
+                questions=questions,
+                collection=collection,
+                embedding_model=embedding_model,
+                run_id=run_id,
+                experiment_type=experiment_type,
+                parser_id=parser_id,
+                chunking_strategy=strategy,
+                embedding_model_name=embedding_model_name,
+                top_k=top_k,
+            )
+        write_jsonl(retrieval_records, strategy_dir / "retrieval_results.jsonl")
+        chunks = chunks_by_strategy[strategy]
+        strategy_results[strategy] = {
+            "collection_name": collection_names_by_strategy[strategy],
+            "chunk_count": len(chunks),
+            "average_chunk_length": average_chunk_length(chunks),
+            "warnings": warnings_by_strategy[strategy],
+            "retrieval_records": retrieval_records,
+            "answer_records": [],
+        }
+
+    progress("Generating answers")
+    for strategy, result in strategy_results.items():
+        strategy_dir = run_dir / strategy
+        answer_records = generate_answers(result["retrieval_records"], answer_model)
+        write_jsonl(answer_records, strategy_dir / "answer_results.jsonl")
+        result["answer_records"] = answer_records
+
+    progress("Saving comparison report")
+    csv_path, report_path = write_chunking_comparison_report(run_dir, questions, strategy_results)
+
+    return {
+        "run_id": run_id,
+        "experiment_type": experiment_type,
+        "run_dir": str(run_dir),
+        "chroma_dir": str(chroma_dir),
+        "parser": parser_id,
+        "chunking_strategies": selected_strategies,
+        "reports": {
+            "chunking_comparison_csv": str(csv_path),
+            "chunking_comparison_report": str(report_path),
+        },
+        "strategy_results": {
+            strategy: {
+                "collection_name": result["collection_name"],
+                "chunk_count": result["chunk_count"],
+                "average_chunk_length": result["average_chunk_length"],
+                "warnings": result["warnings"],
+                "chunks": str(run_dir / strategy / "chunks.jsonl"),
+                "retrieval_results": str(run_dir / strategy / "retrieval_results.jsonl"),
+                "answer_results": str(run_dir / strategy / "answer_results.jsonl"),
+            }
+            for strategy, result in strategy_results.items()
+        },
+    }
+
+
+def run_benchmark_from_config(
+    run_config_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    config = read_yaml(Path(run_config_path))
+    experiment_type = str(config.get("experiment_type", "parser_compare"))
+    if experiment_type == "parser_compare":
+        return run_parser_compare(run_config_path, progress_callback=progress_callback)
+    if experiment_type == "chunking_compare":
+        return run_chunking_compare(run_config_path, progress_callback=progress_callback)
+    raise ValueError(f"Unsupported experiment_type for benchmark runner: {experiment_type}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run benchmark experiments.")
     parser.add_argument(
@@ -656,5 +1257,5 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    result = run_parser_compare(args.run_config)
+    result = run_benchmark_from_config(args.run_config)
     print(json.dumps(result, indent=2))
