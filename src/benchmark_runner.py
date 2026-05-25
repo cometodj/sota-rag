@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import re
+from time import perf_counter
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,6 +102,10 @@ def make_strategy_collection_name(
     base = f"{slugify(run_id)[:18]}__{slugify(parser_id)}__{strategy_slug}__{embedding_slug}"
     digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
     return f"{base[:54].strip('_')}_{digest}"
+
+
+def safe_embedding_model_name(model_name: str) -> str:
+    return slugify(model_name.split("/")[-1])
 
 
 def batch_records(records: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
@@ -869,6 +874,119 @@ def write_chunking_comparison_report(
     return csv_path, report_path
 
 
+def write_embedding_comparison_report(
+    run_dir: Path,
+    questions: list[dict[str, str]],
+    model_results: dict[str, dict[str, Any]],
+) -> tuple[Path, Path]:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = reports_dir / "embedding_comparison.csv"
+    report_path = reports_dir / "embedding_comparison_report.md"
+    model_names = list(model_results)
+
+    retrieval_by_model = {
+        model_name: {
+            str(record["question_id"]): record
+            for record in result["retrieval_records"]
+        }
+        for model_name, result in model_results.items()
+    }
+    answers_by_model = {
+        model_name: {
+            str(record["question_id"]): record
+            for record in result["answer_records"]
+        }
+        for model_name, result in model_results.items()
+    }
+
+    rows: list[dict[str, Any]] = []
+    for question in questions:
+        question_id = question["id"]
+        for model_name in model_names:
+            result = model_results[model_name]
+            retrieval_record = retrieval_by_model[model_name].get(question_id, {})
+            answer_record = answers_by_model[model_name].get(question_id, {})
+            retrieved_chunks = retrieval_record.get("retrieved_chunks", [])
+            rows.append(
+                {
+                    "question_id": question_id,
+                    "question": question["question"],
+                    "embedding_model": model_name,
+                    "retrieved_chunk_count": len(retrieved_chunks),
+                    "retrieved_locations": retrieved_locations(retrieved_chunks),
+                    "answer_preview": preview_text(str(answer_record.get("generated_answer", ""))),
+                    "embedding_runtime_seconds": f"{float(result.get('embedding_runtime_seconds', 0.0)):.3f}",
+                    "warnings": " | ".join(result.get("warnings", [])),
+                }
+            )
+
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        fieldnames = [
+            "question_id",
+            "question",
+            "embedding_model",
+            "retrieved_chunk_count",
+            "retrieved_locations",
+            "answer_preview",
+            "embedding_runtime_seconds",
+            "warnings",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    lines = [
+        "# Embedding Comparison Benchmark Report",
+        "",
+        "## Summary",
+        "",
+        f"- Questions compared: {len(questions)}",
+        f"- Embedding models compared: {', '.join(model_names)}",
+        "",
+        "This report is neutral and does not automatically claim one embedding model is better.",
+        "",
+        "## Model Warnings",
+    ]
+    for model_name in model_names:
+        warnings = model_results[model_name].get("warnings", [])
+        if warnings:
+            lines.append(f"- {model_name}: {' | '.join(warnings)}")
+        else:
+            lines.append(f"- {model_name}: none")
+
+    lines.extend(["", "## Per-Question Comparison"])
+    for question in questions:
+        lines.extend(["", f"### {question['id']}", "", f"Question: {question['question']}"])
+        for row in [item for item in rows if item["question_id"] == question["id"]]:
+            lines.extend(
+                [
+                    "",
+                    f"#### {row['embedding_model']}",
+                    "",
+                    f"- Retrieved chunks: {row['retrieved_chunk_count']}",
+                    f"- Retrieved pages or sections: {row['retrieved_locations'] or 'none'}",
+                    f"- Embedding runtime seconds: {row['embedding_runtime_seconds']}",
+                    f"- Answer preview: {row['answer_preview']}",
+                    f"- Warnings: {row['warnings'] or 'none'}",
+                ]
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Manual Review Notes",
+            "",
+            "- Review whether each answer is grounded in the retrieved chunks.",
+            "- Compare retrieved pages or sections without treating overlap as an automatic quality score.",
+            "- Check whether model-specific retrieved chunks preserve important table and field details.",
+            "- Do not use this report as an automatic embedding model recommendation.",
+        ]
+    )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, report_path
+
+
 def run_parser_compare(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
@@ -1231,6 +1349,220 @@ def run_chunking_compare(
     }
 
 
+def run_embedding_compare(
+    run_config_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    config_path = Path(run_config_path)
+    run_config = read_yaml(config_path)
+    run_dir = config_path.parent
+    pdf_path = Path(run_config.get("uploaded_pdf_path") or run_config["pdf"]["saved_path"])
+    questions_config = run_config.get("benchmark_questions", {})
+    questions_path = Path(
+        run_config.get("benchmark_questions_path")
+        or questions_config.get("saved_path")
+        or questions_config["path"]
+    )
+
+    experiment_type = str(run_config.get("experiment_type", "embedding_compare"))
+    if experiment_type != "embedding_compare":
+        raise ValueError(f"run_embedding_compare only supports experiment_type=embedding_compare: {experiment_type}")
+
+    parser_id = str(run_config["parser"])
+    if parser_id not in SUPPORTED_PARSERS:
+        raise ValueError(f"Unsupported parser for runner: {parser_id}")
+
+    chunking_strategy = str(run_config["chunking_strategy"])
+    if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+        raise ValueError(f"Unsupported chunking strategy: {chunking_strategy}")
+
+    selected_models = [
+        str(model_name)
+        for model_name in run_config.get("selected_embedding_models", [])
+    ]
+    if len(selected_models) < 2:
+        raise ValueError("Embedding Compare requires at least two selected embedding models.")
+
+    retrieval_strategy = str(run_config.get("retrieval_strategy", "dense_vector"))
+    if retrieval_strategy != "dense_vector":
+        raise ValueError(
+            "Embedding Compare runner currently supports only retrieval_strategy='dense_vector'. "
+            f"Received: {retrieval_strategy}"
+        )
+
+    run_id = str(run_config["run_id"])
+    answer_model = str(run_config["answer_model"])
+    top_k = int(run_config["top_k"])
+    chunk_size = int(run_config.get("chunk_size", 800))
+    chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    questions = read_benchmark_questions(questions_path)
+    chroma_dir = run_dir / "chroma"
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(chroma_dir))
+    model_results: dict[str, dict[str, Any]] = {}
+
+    total_steps = 8
+    step = 0
+
+    def progress(message: str) -> None:
+        nonlocal step
+        step += 1
+        if progress_callback:
+            progress_callback(message, step, total_steps)
+        else:
+            print(f"[{step}/{total_steps}] {message}")
+
+    progress("Preparing run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    progress("Extracting document")
+    extracted_records, extraction_warnings = extract_document(parser_id, pdf_path, run_dir / "extraction")
+
+    progress("Chunking document")
+    chunks, chunk_warnings = create_chunks_for_strategy(
+        parser_id,
+        extracted_records,
+        chunking_strategy,
+        chunk_size,
+        chunk_overlap,
+    )
+    chunk_warnings = extraction_warnings + chunk_warnings
+    chunks_dir = run_dir / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(chunks, chunks_dir / "chunks.jsonl")
+
+    progress("Running embedding models")
+    embedding_models: dict[str, BenchmarkEmbeddingModel | None] = {}
+    runtime_by_model: dict[str, float] = {}
+    warnings_by_model: dict[str, list[str]] = {}
+    for model_name in selected_models:
+        start = perf_counter()
+        try:
+            embedding_models[model_name] = BenchmarkEmbeddingModel(model_name)
+            warnings_by_model[model_name] = list(chunk_warnings)
+        except Exception as exc:
+            embedding_models[model_name] = None
+            warnings_by_model[model_name] = list(chunk_warnings) + [
+                f"Embedding model failed to load: {exc}"
+            ]
+        runtime_by_model[model_name] = perf_counter() - start
+
+    progress("Building vector DBs")
+    collections_by_model: dict[str, Any] = {}
+    collection_names_by_model: dict[str, str] = {}
+    for model_name, embedding_model in embedding_models.items():
+        safe_model_name = safe_embedding_model_name(model_name)
+        model_dir = run_dir / "embeddings" / safe_model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        collection_name = make_strategy_collection_name(
+            run_id=run_id,
+            parser_id=parser_id,
+            chunking_strategy=chunking_strategy,
+            embedding_model_name=model_name,
+        )
+        collection_names_by_model[model_name] = collection_name
+        if embedding_model is None:
+            continue
+
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={
+                "parser": parser_id,
+                "embedding_model": model_name,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": retrieval_strategy,
+            },
+        )
+        start = perf_counter()
+        try:
+            if chunks:
+                index_chunks(chunks, collection, embedding_model, parser_id)
+            collections_by_model[model_name] = collection
+        except Exception as exc:
+            warnings_by_model[model_name].append(f"Embedding/indexing failed: {exc}")
+            embedding_models[model_name] = None
+        runtime_by_model[model_name] += perf_counter() - start
+
+    progress("Running retrieval")
+    for model_name in selected_models:
+        safe_model_name = safe_embedding_model_name(model_name)
+        model_dir = run_dir / "embeddings" / safe_model_name
+        embedding_model = embedding_models.get(model_name)
+        collection = collections_by_model.get(model_name)
+        if embedding_model is None or collection is None or not chunks:
+            retrieval_records = empty_retrieval_records(
+                questions,
+                run_id,
+                experiment_type,
+                parser_id,
+                chunking_strategy,
+                model_name,
+                top_k,
+            )
+        else:
+            retrieval_records = retrieve_questions(
+                questions=questions,
+                collection=collection,
+                embedding_model=embedding_model,
+                run_id=run_id,
+                experiment_type=experiment_type,
+                parser_id=parser_id,
+                chunking_strategy=chunking_strategy,
+                embedding_model_name=model_name,
+                top_k=top_k,
+            )
+        write_jsonl(retrieval_records, model_dir / "retrieval_results.jsonl")
+        model_results[model_name] = {
+            "safe_model_name": safe_model_name,
+            "collection_name": collection_names_by_model.get(model_name, ""),
+            "embedding_runtime_seconds": runtime_by_model.get(model_name, 0.0),
+            "warnings": warnings_by_model.get(model_name, []),
+            "retrieval_records": retrieval_records,
+            "answer_records": [],
+        }
+
+    progress("Generating answers")
+    for model_name, result in model_results.items():
+        model_dir = run_dir / "embeddings" / str(result["safe_model_name"])
+        answer_records = generate_answers(result["retrieval_records"], answer_model)
+        write_jsonl(answer_records, model_dir / "answer_results.jsonl")
+        result["answer_records"] = answer_records
+
+    progress("Saving comparison report")
+    csv_path, report_path = write_embedding_comparison_report(run_dir, questions, model_results)
+
+    return {
+        "run_id": run_id,
+        "experiment_type": experiment_type,
+        "run_dir": str(run_dir),
+        "chroma_dir": str(chroma_dir),
+        "parser": parser_id,
+        "chunking_strategy": chunking_strategy,
+        "embedding_models": selected_models,
+        "reports": {
+            "embedding_comparison_csv": str(csv_path),
+            "embedding_comparison_report": str(report_path),
+        },
+        "model_results": {
+            model_name: {
+                "safe_model_name": result["safe_model_name"],
+                "collection_name": result["collection_name"],
+                "embedding_runtime_seconds": result["embedding_runtime_seconds"],
+                "warnings": result["warnings"],
+                "retrieval_results": str(
+                    run_dir / "embeddings" / str(result["safe_model_name"]) / "retrieval_results.jsonl"
+                ),
+                "answer_results": str(
+                    run_dir / "embeddings" / str(result["safe_model_name"]) / "answer_results.jsonl"
+                ),
+            }
+            for model_name, result in model_results.items()
+        },
+    }
+
+
 def run_benchmark_from_config(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
@@ -1241,6 +1573,8 @@ def run_benchmark_from_config(
         return run_parser_compare(run_config_path, progress_callback=progress_callback)
     if experiment_type == "chunking_compare":
         return run_chunking_compare(run_config_path, progress_callback=progress_callback)
+    if experiment_type == "embedding_compare":
+        return run_embedding_compare(run_config_path, progress_callback=progress_callback)
     raise ValueError(f"Unsupported experiment_type for benchmark runner: {experiment_type}")
 
 
