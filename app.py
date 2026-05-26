@@ -1304,6 +1304,7 @@ def setup_run_config(experiment_type: str, top_k: int) -> dict[str, Any]:
         "top_k": int(top_k),
         "uploaded_pdf_path": None,
         "benchmark_questions_path": str(BENCHMARK_QUESTIONS_PATH),
+        "notes": "Configured from Streamlit Benchmark Tool. Execution is not started by this cleanup UI flow.",
         "execution": {
             "status": "configured_only",
             "note": "Benchmark execution is intentionally not run from this UI yet.",
@@ -1394,6 +1395,74 @@ def render_fixed_retrieval_strategy(key: str) -> str:
         key=key,
         help="Fixed for now. Retrieval strategy comparison is coming later.",
     )
+
+
+def render_experiment_context(variable: str, fixed: list[str]) -> None:
+    st.info(
+        f"Variable under test: {variable}. Fixed variables: {', '.join(fixed)}."
+    )
+    st.caption(f"Benchmark questions path: `{BENCHMARK_QUESTIONS_PATH}`")
+
+
+def render_result_area(run_dir: Path, experiment_type: str) -> None:
+    st.markdown("#### Result Area")
+    result_paths_by_experiment = {
+        "parser_compare": [
+            run_dir / "reports" / "parser_comparison_report.md",
+            run_dir / "reports" / "parser_comparison.csv",
+        ],
+        "chunking_compare": [
+            run_dir / "reports" / "chunking_comparison_report.md",
+            run_dir / "reports" / "chunking_comparison.csv",
+        ],
+        "embedding_compare": [
+            run_dir / "reports" / "embedding_comparison_report.md",
+            run_dir / "reports" / "embedding_comparison.csv",
+        ],
+        "retrieval_fusion_compare": [
+            run_dir / "fusion" / "fused_retrieval_results.jsonl",
+            run_dir / "fusion" / "answer_results.jsonl",
+            run_dir / "reports" / "retrieval_fusion_comparison_report.md",
+        ],
+    }
+    existing_paths = [
+        path for path in result_paths_by_experiment.get(experiment_type, []) if path.exists()
+    ]
+    if not existing_paths:
+        st.info("Benchmark execution is not implemented or not completed for this run yet.")
+        return
+
+    for path in existing_paths:
+        st.caption(f"Found result file: `{path}`")
+        if path.suffix == ".md":
+            markdown, error = read_markdown(path)
+            if error:
+                st.warning(error)
+            else:
+                st.markdown(markdown)
+        elif path.suffix == ".csv":
+            dataframe, error = read_csv(path)
+            if error:
+                st.warning(error)
+            else:
+                st.dataframe(dataframe, hide_index=True, use_container_width=True)
+        elif path.suffix == ".jsonl":
+            records, error = read_jsonl(path)
+            if error:
+                st.warning(error)
+            else:
+                st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
+
+
+def save_configured_run(
+    run_config: dict[str, Any],
+    uploaded_pdf: Any,
+    experiment_type: str,
+) -> None:
+    run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+    render_placeholder_status()
+    render_saved_run(run_id, run_dir, config_path, run_config)
+    render_result_area(run_dir, experiment_type)
 
 
 def parser_result_records(runner_result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -1744,16 +1813,25 @@ def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
 
 def render_parser_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Parser Compare")
-    st.info(
-        "Change only the document parser. Chunking strategy, embedding model, answer model, "
-        "retrieval strategy, benchmark questions, and top_k stay fixed."
+    render_experiment_context(
+        variable="parser",
+        fixed=[
+            "chunking_strategy",
+            "embedding_model",
+            "answer_model",
+            "top_k",
+            "benchmark_questions_path",
+        ],
     )
 
     embedding_options, answer_options, default_embedding, default_answer, default_top_k = benchmark_defaults(config)
     uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="parser_compare_pdf")
     selected_parsers = selected_parser_ids_from_checkboxes("parser_compare_parser")
-    chunking_strategy = st.selectbox("Chunking strategy", options=["fixed-size"], key="parser_compare_chunking")
-    retrieval_strategy = render_fixed_retrieval_strategy("parser_compare_retrieval_strategy")
+    chunking_strategy = st.selectbox(
+        "Chunking strategy",
+        options=CHUNKING_STRATEGY_OPTIONS,
+        key="parser_compare_chunking",
+    )
     embedding_model = st.selectbox(
         "Embedding model",
         options=embedding_options,
@@ -1785,7 +1863,6 @@ def render_parser_compare_tab(config: dict[str, Any]) -> None:
     for error in validation_errors:
         st.warning(error)
 
-    rendered_current_results = False
     if st.button("Run Parser Benchmark", type="primary", key="run_parser_compare"):
         errors = validate_setup_inputs(uploaded_pdf, validation_errors)
         if errors:
@@ -1798,7 +1875,7 @@ def render_parser_compare_tab(config: dict[str, Any]) -> None:
             {
                 "selected_parsers": selected_parsers,
                 "chunking_strategy": chunking_strategy,
-                "retrieval_strategy": retrieval_strategy,
+                "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
                 "embedding_model": embedding_model,
                 "answer_model": answer_model,
                 "chunk_size": safe_int(
@@ -1811,55 +1888,31 @@ def render_parser_compare_tab(config: dict[str, Any]) -> None:
                 ),
             }
         )
-        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
-        render_saved_run(run_id, run_dir, config_path, run_config)
-
-        progress_bar = st.progress(0)
-        with st.status("Running parser comparison benchmark", expanded=True) as status:
-            try:
-                from benchmark_runner import run_parser_compare
-
-                def update_progress(message: str, step: int, total: int) -> None:
-                    progress_bar.progress(step / total)
-                    st.write(message)
-
-                runner_result = run_parser_compare(
-                    config_path,
-                    progress_callback=update_progress,
-                )
-            except Exception as exc:
-                status.update(label="Parser benchmark failed", state="error")
-                st.error(f"Parser benchmark failed: {exc}")
-                return
-
-            status.update(label="Parser benchmark complete", state="complete")
-
-        st.session_state["last_parser_compare_result"] = runner_result
-        render_parser_compare_results(runner_result)
-        rendered_current_results = True
-
-    if "last_parser_compare_result" in st.session_state and not rendered_current_results:
-        with st.expander("Latest Parser Compare Results", expanded=False):
-            render_parser_compare_results(dict(st.session_state["last_parser_compare_result"]))
+        save_configured_run(run_config, uploaded_pdf, "parser_compare")
 
 
 def render_chunking_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Chunking Compare")
-    st.info(
-        "Change only the chunking strategy. Parser, embedding model, answer model, "
-        "retrieval strategy, benchmark questions, and top_k stay fixed."
+    render_experiment_context(
+        variable="chunking_strategy",
+        fixed=[
+            "parser",
+            "embedding_model",
+            "answer_model",
+            "top_k",
+            "benchmark_questions_path",
+        ],
     )
 
     embedding_options, answer_options, default_embedding, default_answer, default_top_k = benchmark_defaults(config)
     uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="chunking_compare_pdf")
     parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="chunking_compare_parser")
-    selected_chunking_strategies = selected_options_from_checkboxes(
+    selected_chunking_strategies = st.multiselect(
         "Chunking strategies",
-        CHUNKING_STRATEGY_OPTIONS,
-        ["fixed-size", "page-based"],
-        "chunking_compare_strategy",
+        options=CHUNKING_STRATEGY_OPTIONS,
+        default=["fixed-size", "page-based"],
+        key="chunking_compare_strategies",
     )
-    retrieval_strategy = render_fixed_retrieval_strategy("chunking_compare_retrieval_strategy")
     embedding_model = st.selectbox(
         "Embedding model",
         options=embedding_options,
@@ -1891,7 +1944,6 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
     for error in validation_errors:
         st.warning(error)
 
-    rendered_current_results = False
     if st.button("Run Chunking Benchmark", type="primary", key="run_chunking_compare"):
         errors = validate_setup_inputs(uploaded_pdf, validation_errors)
         if errors:
@@ -1904,7 +1956,7 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
             {
                 "parser": PARSER_ID_BY_LABEL[parser_label],
                 "selected_chunking_strategies": selected_chunking_strategies,
-                "retrieval_strategy": retrieval_strategy,
+                "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
                 "embedding_model": embedding_model,
                 "answer_model": answer_model,
                 "chunk_size": safe_int(
@@ -1917,48 +1969,25 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
                 ),
             }
         )
-        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
-        render_saved_run(run_id, run_dir, config_path, run_config)
-
-        progress_bar = st.progress(0)
-        with st.status("Running chunking comparison benchmark", expanded=True) as status:
-            try:
-                from benchmark_runner import run_chunking_compare
-
-                def update_progress(message: str, step: int, total: int) -> None:
-                    progress_bar.progress(step / total)
-                    st.write(message)
-
-                runner_result = run_chunking_compare(
-                    config_path,
-                    progress_callback=update_progress,
-                )
-            except Exception as exc:
-                status.update(label="Chunking benchmark failed", state="error")
-                st.error(f"Chunking benchmark failed: {exc}")
-                return
-
-            status.update(label="Chunking benchmark complete", state="complete")
-
-        st.session_state["last_chunking_compare_result"] = runner_result
-        render_chunking_compare_results(runner_result)
-        rendered_current_results = True
-
-    if "last_chunking_compare_result" in st.session_state and not rendered_current_results:
-        with st.expander("Latest Chunking Compare Results", expanded=False):
-            render_chunking_compare_results(dict(st.session_state["last_chunking_compare_result"]))
+        save_configured_run(run_config, uploaded_pdf, "chunking_compare")
 
 
 def render_embedding_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Embedding Compare")
-    st.info(
-        "Change only the embedding model. Parser, chunking strategy, answer model, "
-        "retrieval strategy, benchmark questions, and top_k stay fixed."
+    render_experiment_context(
+        variable="embedding_model",
+        fixed=[
+            "parser",
+            "chunking_strategy",
+            "answer_model",
+            "top_k",
+            "benchmark_questions_path",
+        ],
     )
 
-    embedding_options, answer_options, _default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    _embedding_options, answer_options, _default_embedding, default_answer, default_top_k = benchmark_defaults(config)
     default_embeddings = [
-        model for model in EMBEDDING_MODEL_OPTIONS[:2] if model in embedding_options
+        model for model in EMBEDDING_MODEL_OPTIONS[:2]
     ]
     uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="embedding_compare_pdf")
     parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="embedding_compare_parser")
@@ -1967,12 +1996,11 @@ def render_embedding_compare_tab(config: dict[str, Any]) -> None:
         options=CHUNKING_STRATEGY_OPTIONS,
         key="embedding_compare_chunking",
     )
-    retrieval_strategy = render_fixed_retrieval_strategy("embedding_compare_retrieval_strategy")
-    selected_embedding_models = selected_options_from_checkboxes(
+    selected_embedding_models = st.multiselect(
         "Embedding models",
-        embedding_options,
-        default_embeddings,
-        "embedding_compare_model",
+        options=EMBEDDING_MODEL_OPTIONS,
+        default=default_embeddings,
+        key="embedding_compare_models",
     )
     answer_model = st.selectbox(
         "Answer model",
@@ -1999,7 +2027,6 @@ def render_embedding_compare_tab(config: dict[str, Any]) -> None:
     for error in validation_errors:
         st.warning(error)
 
-    rendered_current_results = False
     if st.button("Run Embedding Benchmark", type="primary", key="run_embedding_compare"):
         errors = validate_setup_inputs(uploaded_pdf, validation_errors)
         if errors:
@@ -2012,7 +2039,7 @@ def render_embedding_compare_tab(config: dict[str, Any]) -> None:
             {
                 "parser": PARSER_ID_BY_LABEL[parser_label],
                 "chunking_strategy": chunking_strategy,
-                "retrieval_strategy": retrieval_strategy,
+                "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
                 "selected_embedding_models": selected_embedding_models,
                 "answer_model": answer_model,
                 "chunk_size": safe_int(
@@ -2025,43 +2052,19 @@ def render_embedding_compare_tab(config: dict[str, Any]) -> None:
                 ),
             }
         )
-        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
-        render_saved_run(run_id, run_dir, config_path, run_config)
-
-        progress_bar = st.progress(0)
-        with st.status("Running embedding comparison benchmark", expanded=True) as status:
-            try:
-                from benchmark_runner import run_embedding_compare
-
-                def update_progress(message: str, step: int, total: int) -> None:
-                    progress_bar.progress(step / total)
-                    st.write(message)
-
-                runner_result = run_embedding_compare(
-                    config_path,
-                    progress_callback=update_progress,
-                )
-            except Exception as exc:
-                status.update(label="Embedding benchmark failed", state="error")
-                st.error(f"Embedding benchmark failed: {exc}")
-                return
-
-            status.update(label="Embedding benchmark complete", state="complete")
-
-        st.session_state["last_embedding_compare_result"] = runner_result
-        render_embedding_compare_results(runner_result)
-        rendered_current_results = True
-
-    if "last_embedding_compare_result" in st.session_state and not rendered_current_results:
-        with st.expander("Latest Embedding Compare Results", expanded=False):
-            render_embedding_compare_results(dict(st.session_state["last_embedding_compare_result"]))
+        save_configured_run(run_config, uploaded_pdf, "embedding_compare")
 
 
 def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Retrieval Fusion Compare")
-    st.info(
-        "Change only the retrieval fusion strategy over multiple embedding-model-specific vector DBs. "
-        "Parser, chunking strategy, answer model, benchmark questions, and final_top_k stay fixed."
+    render_experiment_context(
+        variable="retrieval fusion strategy",
+        fixed=[
+            "parser",
+            "chunking_strategy",
+            "answer_model",
+            "benchmark_questions_path",
+        ],
     )
 
     _embedding_options, answer_options, _default_embedding, default_answer, default_top_k = benchmark_defaults(config)
@@ -2116,12 +2119,14 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
         validation_errors.append("Select at least two embedding models.")
     if benchmark_questions_error:
         validation_errors.append(benchmark_questions_error)
-    if int(per_model_top_k) < int(final_top_k):
-        st.warning("per_model_top_k is smaller than final_top_k; fused results may contain fewer final chunks.")
+    if int(final_top_k) > int(per_model_top_k) * max(len(selected_embedding_models), 1):
+        st.warning(
+            "final_top_k is larger than per_model_top_k multiplied by the number of embedding models; "
+            "fused results may contain fewer final chunks."
+        )
     for error in validation_errors:
         st.warning(error)
 
-    rendered_current_results = False
     if st.button("Run Retrieval Fusion Benchmark", type="primary", key="run_retrieval_fusion"):
         errors = validate_setup_inputs(uploaded_pdf, validation_errors)
         if errors:
@@ -2134,7 +2139,7 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
             {
                 "parser": PARSER_ID_BY_LABEL[parser_label],
                 "chunking_strategy": chunking_strategy,
-                "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
+                "retrieval_strategy": "fusion",
                 "selected_embedding_models": selected_embedding_models,
                 "fusion_method": fusion_method,
                 "answer_model": answer_model,
@@ -2151,44 +2156,15 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
                 ),
             }
         )
-        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
-        render_saved_run(run_id, run_dir, config_path, run_config)
-
-        progress_bar = st.progress(0)
-        with st.status("Running retrieval fusion benchmark", expanded=True) as status:
-            try:
-                from benchmark_runner import run_retrieval_fusion_compare
-
-                def update_progress(message: str, step: int, total: int) -> None:
-                    progress_bar.progress(step / total)
-                    st.write(message)
-
-                runner_result = run_retrieval_fusion_compare(
-                    config_path,
-                    progress_callback=update_progress,
-                )
-            except Exception as exc:
-                status.update(label="Retrieval fusion benchmark failed", state="error")
-                st.error(f"Retrieval fusion benchmark failed: {exc}")
-                return
-
-            status.update(label="Retrieval fusion benchmark complete", state="complete")
-
-        st.session_state["last_retrieval_fusion_result"] = runner_result
-        render_retrieval_fusion_results(runner_result)
-        rendered_current_results = True
-
-    if "last_retrieval_fusion_result" in st.session_state and not rendered_current_results:
-        with st.expander("Latest Retrieval Fusion Results", expanded=False):
-            render_retrieval_fusion_results(dict(st.session_state["last_retrieval_fusion_result"]))
+        save_configured_run(run_config, uploaded_pdf, "retrieval_fusion_compare")
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(
-        "Configure and run controlled benchmark comparisons. Query expansion, judging, reranking, "
-        "and answer-model comparison are intentionally excluded."
+        "Configure controlled benchmark comparisons and save run_config.yaml files. "
+        "Execution, query expansion, judging, reranking, and answer-model comparison are intentionally excluded here."
     )
 
     config, config_error = load_config(CONFIG_PATH)
