@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -47,6 +48,7 @@ EXPECTED_FILES = [
 ]
 PREVIEW_LIMIT = 420
 RUNS_DIR = OUTPUT_DIR / "runs"
+DOCUMENT_PROFILES_PATH = OUTPUT_DIR / "document_profiles.json"
 EMBEDDING_MODEL_OPTIONS = [
     "sentence-transformers/all-MiniLM-L6-v2",
     "BAAI/bge-small-en-v1.5",
@@ -1730,6 +1732,509 @@ def render_parser_fusion_existing_results_browser() -> None:
     render_raw_json_expander("Raw answer record", answer_record)
 
 
+def safe_profile_name(value: str) -> str:
+    name = value.split("/")[-1]
+    return re.sub(r"[^a-zA-Z0-9]+", "_", name.strip().lower()).strip("_") or "value"
+
+
+def list_benchmark_runs() -> list[tuple[str, Path, dict[str, Any]]]:
+    if not RUNS_DIR.exists():
+        return []
+
+    runs: list[tuple[str, Path, dict[str, Any]]] = []
+    for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        run_config, error = load_run_config(run_dir)
+        if error:
+            continue
+        runs.append((run_dir.name, run_dir, run_config))
+    return runs
+
+
+def discover_answer_result_files(
+    run_dir: Path,
+    run_config: dict[str, Any],
+) -> list[tuple[str, Path]]:
+    experiment_type = str(run_config.get("experiment_type", ""))
+
+    if experiment_type == "parser_compare":
+        parsers = run_config.get("selected_parsers") or ["pymupdf", "docling"]
+        return [(str(parser_id), run_dir / str(parser_id) / "answer_results.jsonl") for parser_id in parsers]
+
+    if experiment_type == "chunking_compare":
+        strategies = run_config.get("selected_chunking_strategies") or []
+        return [
+            (str(strategy), run_dir / str(strategy) / "answer_results.jsonl")
+            for strategy in strategies
+        ]
+
+    if experiment_type == "embedding_compare":
+        models = run_config.get("selected_embedding_models") or []
+        return [
+            (
+                safe_profile_name(str(model_name)),
+                run_dir / "embeddings" / safe_profile_name(str(model_name)) / "answer_results.jsonl",
+            )
+            for model_name in models
+        ]
+
+    if experiment_type == "retrieval_fusion_compare":
+        return [("fusion result", run_dir / "fusion" / "answer_results.jsonl")]
+
+    if experiment_type == "parser_fusion_compare":
+        return [("parser fusion result", run_dir / "parser_fusion" / "answer_results.jsonl")]
+
+    return []
+
+
+def load_answer_results_for_run(
+    run_dir: Path,
+    run_config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for case_name, path in discover_answer_result_files(run_dir, run_config):
+        if not path.exists():
+            warnings.append(f"Missing answer result file for {case_name}: {path}")
+            continue
+        case_records, error = load_jsonl_records(path)
+        if error:
+            warnings.append(error)
+            continue
+        for record in case_records:
+            enriched = dict(record)
+            enriched["case_name"] = case_name
+            enriched["answer_results_path"] = str(path)
+            records.append(enriched)
+    return records, warnings
+
+
+def group_answers_by_question(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        question_id = question_id_value(record)
+        if question_id:
+            grouped[question_id].append(record)
+    return dict(grouped)
+
+
+def make_answer_preview(answer: Any, limit: int = 260) -> str:
+    return preview_text(answer, limit=limit)
+
+
+def answer_context_chunks(record: dict[str, Any]) -> list[dict[str, Any]]:
+    chunks = record.get("retrieved_chunks") or record.get("fused_chunks") or record.get("chunks") or []
+    return chunks if isinstance(chunks, list) else []
+
+
+def answer_comparison_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        rows.append(
+            {
+                "question_id": question_id_value(record),
+                "case_name": record.get("case_name", "N/A"),
+                "parser": record.get("parser", "N/A"),
+                "chunking_strategy": record.get("chunking_strategy", "N/A"),
+                "embedding_model": record.get("embedding_model", "N/A"),
+                "retrieval_strategy": record.get("retrieval_strategy", "N/A"),
+                "fusion_method": record.get("fusion_method", "N/A"),
+                "answer_model": record.get("answer_model", "N/A"),
+                "answer_preview": make_answer_preview(record.get("generated_answer", "")),
+            }
+        )
+    return rows
+
+
+def load_document_profiles() -> dict[str, Any]:
+    if not DOCUMENT_PROFILES_PATH.exists():
+        return {"documents": []}
+    try:
+        profiles = json.loads(DOCUMENT_PROFILES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"documents": []}
+    if not isinstance(profiles, dict):
+        return {"documents": []}
+    documents = profiles.get("documents")
+    if not isinstance(documents, list):
+        profiles["documents"] = []
+    return profiles
+
+
+def save_document_profiles(profiles: dict[str, Any]) -> None:
+    DOCUMENT_PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DOCUMENT_PROFILES_PATH.write_text(
+        json.dumps(profiles, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def upsert_document_profile(profile: dict[str, Any]) -> None:
+    profiles = load_document_profiles()
+    documents = profiles.setdefault("documents", [])
+    document_id = str(profile["document_id"])
+    for index, existing in enumerate(documents):
+        if str(existing.get("document_id")) == document_id:
+            documents[index] = profile
+            save_document_profiles(profiles)
+            return
+    documents.append(profile)
+    save_document_profiles(profiles)
+
+
+def saved_profile_rows(profiles: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for document in profiles.get("documents", []):
+        selected_profile = document.get("selected_profile", {})
+        rows.append(
+            {
+                "document_id": document.get("document_id", ""),
+                "file_name": document.get("file_name", ""),
+                "source_run_id": document.get("source_run_id", ""),
+                "parser_mode": selected_profile.get("parser_mode", ""),
+                "chunking_strategy": selected_profile.get("chunking_strategy", ""),
+                "embedding_mode": selected_profile.get("embedding_mode", ""),
+                "retrieval_strategy": selected_profile.get("retrieval_strategy", ""),
+                "fusion_method": selected_profile.get("fusion_method", ""),
+                "answer_model": selected_profile.get("answer_model", ""),
+                "selected_at": document.get("selected_at", ""),
+                "notes_preview": preview_text(document.get("notes", ""), limit=120),
+            }
+        )
+    return rows
+
+
+def profile_defaults(run_id: str, run_config: dict[str, Any]) -> dict[str, Any]:
+    experiment_type = str(run_config.get("experiment_type", ""))
+    uploaded_pdf_path = str(run_config.get("uploaded_pdf_path", ""))
+    file_name = Path(uploaded_pdf_path).name if uploaded_pdf_path else ""
+    selected_parsers = run_config.get("selected_parsers") or (
+        [run_config["parser"]] if run_config.get("parser") else []
+    )
+    selected_embedding_models = run_config.get("selected_embedding_models") or (
+        [run_config["embedding_model"]] if run_config.get("embedding_model") else []
+    )
+
+    parser_mode = "single_parser"
+    embedding_mode = "single_embedding"
+    retrieval_strategy = str(run_config.get("retrieval_strategy", DEFAULT_RETRIEVAL_STRATEGY))
+    if experiment_type == "parser_fusion_compare":
+        parser_mode = "parser_fusion"
+        retrieval_strategy = "parser_fusion"
+    if experiment_type == "retrieval_fusion_compare":
+        embedding_mode = "multi_embedding_fusion"
+        retrieval_strategy = "multi_embedding_fusion"
+
+    return {
+        "document_id": Path(file_name).stem or run_id,
+        "file_name": file_name,
+        "source_run_id": run_id,
+        "parser_mode": parser_mode,
+        "selected_parsers": selected_parsers,
+        "chunking_strategy": run_config.get("chunking_strategy", ""),
+        "embedding_mode": embedding_mode,
+        "embedding_model": run_config.get("embedding_model", ""),
+        "selected_embedding_models": selected_embedding_models,
+        "retrieval_strategy": retrieval_strategy,
+        "fusion_method": run_config.get("fusion_method", ""),
+        "top_k": run_config.get("top_k", run_config.get("final_top_k", "")),
+        "per_model_top_k": run_config.get("per_model_top_k", ""),
+        "per_parser_top_k": run_config.get("per_parser_top_k", ""),
+        "final_top_k": run_config.get("final_top_k", ""),
+        "answer_model": run_config.get("answer_model", ""),
+        "notes": "",
+    }
+
+
+def render_run_config_summary(run_config: dict[str, Any]) -> None:
+    summary_keys = [
+        "run_id",
+        "experiment_type",
+        "uploaded_pdf_path",
+        "benchmark_questions_path",
+        "parser",
+        "selected_parsers",
+        "chunking_strategy",
+        "selected_chunking_strategies",
+        "embedding_model",
+        "selected_embedding_models",
+        "retrieval_strategy",
+        "fusion_method",
+        "answer_model",
+        "top_k",
+        "per_model_top_k",
+        "per_parser_top_k",
+        "final_top_k",
+    ]
+    st.write({key: run_config.get(key, "N/A") for key in summary_keys if key in run_config})
+
+
+def render_answer_case(case_record: dict[str, Any]) -> None:
+    st.markdown(f"#### {case_record.get('case_name', 'N/A')}")
+    st.write(
+        {
+            "question_id": question_id_value(case_record) or "N/A",
+            "question": case_record.get("question", "N/A"),
+            "parser": case_record.get("parser", "N/A"),
+            "chunking_strategy": case_record.get("chunking_strategy", "N/A"),
+            "embedding_model": case_record.get("embedding_model", "N/A"),
+            "fusion_method": case_record.get("fusion_method", "N/A"),
+            "answer_model": case_record.get("answer_model", "N/A"),
+        }
+    )
+    st.markdown("##### Answer Preview")
+    st.write(make_answer_preview(case_record.get("generated_answer", "")))
+    with st.expander("Full generated answer", expanded=False):
+        st.markdown(str(case_record.get("generated_answer") or "N/A"))
+    with st.expander("Retrieved or fused chunks", expanded=False):
+        chunks = answer_context_chunks(case_record)
+        if chunks:
+            render_chunk_table(chunks, "No chunks found.")
+        else:
+            st.info("No retrieved_chunks or fused_chunks field found for this answer record.")
+
+
+def run_config_list_value(run_config: dict[str, Any], plural_key: str, singular_key: str) -> list[str]:
+    values = run_config.get(plural_key)
+    if isinstance(values, list):
+        return [str(value) for value in values]
+    value = run_config.get(singular_key)
+    return [str(value)] if value not in (None, "") else []
+
+
+def render_best_profile_form(run_id: str, run_config: dict[str, Any]) -> None:
+    defaults = profile_defaults(run_id, run_config)
+    selected_parsers_from_config = run_config_list_value(
+        run_config,
+        "selected_parsers",
+        "parser",
+    )
+    selected_embeddings_from_config = run_config_list_value(
+        run_config,
+        "selected_embedding_models",
+        "embedding_model",
+    )
+    chunking_options = unique_preserve_order(
+        CHUNKING_STRATEGY_OPTIONS
+        + [str(run_config.get("chunking_strategy", ""))]
+        + [str(value) for value in run_config.get("selected_chunking_strategies", [])]
+    )
+    chunking_options = [value for value in chunking_options if value]
+    embedding_options = unique_preserve_order(
+        EMBEDDING_MODEL_OPTIONS
+        + selected_embeddings_from_config
+        + [str(defaults.get("embedding_model", ""))]
+    )
+    embedding_options = [value for value in embedding_options if value]
+    answer_options = unique_preserve_order(
+        ANSWER_MODEL_OPTIONS + [str(defaults.get("answer_model", ""))]
+    )
+    answer_options = [value for value in answer_options if value]
+    parser_options = unique_preserve_order(["pymupdf", "docling"] + selected_parsers_from_config)
+
+    st.markdown("### Manual Best Profile Selection")
+    with st.form(f"best_profile_form_{run_id}"):
+        document_id = st.text_input("document_id", value=str(defaults["document_id"]))
+        file_name = st.text_input("file_name", value=str(defaults["file_name"]))
+        source_run_id = st.text_input("source_run_id", value=str(defaults["source_run_id"]))
+        parser_mode = st.selectbox(
+            "parser_mode",
+            options=["single_parser", "parser_fusion"],
+            index=default_index(["single_parser", "parser_fusion"], str(defaults["parser_mode"])),
+        )
+        selected_parsers = st.multiselect(
+            "selected_parsers",
+            options=parser_options,
+            default=[value for value in selected_parsers_from_config if value in parser_options],
+        )
+        chunking_strategy = st.selectbox(
+            "chunking_strategy",
+            options=chunking_options or CHUNKING_STRATEGY_OPTIONS,
+            index=default_index(chunking_options or CHUNKING_STRATEGY_OPTIONS, str(defaults["chunking_strategy"])),
+        )
+        embedding_mode = st.selectbox(
+            "embedding_mode",
+            options=["single_embedding", "multi_embedding_fusion"],
+            index=default_index(
+                ["single_embedding", "multi_embedding_fusion"],
+                str(defaults["embedding_mode"]),
+            ),
+        )
+        embedding_model = st.selectbox(
+            "embedding_model",
+            options=embedding_options or EMBEDDING_MODEL_OPTIONS,
+            index=default_index(embedding_options or EMBEDDING_MODEL_OPTIONS, str(defaults["embedding_model"])),
+        )
+        selected_embedding_models = st.multiselect(
+            "selected_embedding_models",
+            options=embedding_options or EMBEDDING_MODEL_OPTIONS,
+            default=[
+                value
+                for value in selected_embeddings_from_config
+                if value in (embedding_options or EMBEDDING_MODEL_OPTIONS)
+            ],
+        )
+        retrieval_strategy = st.text_input(
+            "retrieval_strategy",
+            value=str(defaults["retrieval_strategy"]),
+        )
+        fusion_method = st.selectbox(
+            "fusion_method",
+            options=unique_preserve_order(
+                ["", "union_dedup", "rrf", str(defaults.get("fusion_method", ""))]
+            ),
+            index=default_index(
+                unique_preserve_order(["", "union_dedup", "rrf", str(defaults.get("fusion_method", ""))]),
+                str(defaults.get("fusion_method", "")),
+            ),
+        )
+        top_k = st.number_input("top_k", min_value=0, value=safe_int(defaults["top_k"], 0), step=1)
+        per_model_top_k = st.number_input(
+            "per_model_top_k",
+            min_value=0,
+            value=safe_int(defaults["per_model_top_k"], 0),
+            step=1,
+        )
+        per_parser_top_k = st.number_input(
+            "per_parser_top_k",
+            min_value=0,
+            value=safe_int(defaults["per_parser_top_k"], 0),
+            step=1,
+        )
+        final_top_k = st.number_input(
+            "final_top_k",
+            min_value=0,
+            value=safe_int(defaults["final_top_k"], 0),
+            step=1,
+        )
+        answer_model = st.selectbox(
+            "answer_model",
+            options=answer_options or ANSWER_MODEL_OPTIONS,
+            index=default_index(answer_options or ANSWER_MODEL_OPTIONS, str(defaults["answer_model"])),
+        )
+        notes = st.text_area("notes", value=str(defaults["notes"]))
+        submitted = st.form_submit_button("Save Best Profile", type="primary")
+
+    if submitted:
+        profile = {
+            "document_id": document_id,
+            "file_name": file_name,
+            "source_run_id": source_run_id,
+            "selected_profile": {
+                "parser_mode": parser_mode,
+                "selected_parsers": selected_parsers,
+                "chunking_strategy": chunking_strategy,
+                "embedding_mode": embedding_mode,
+                "embedding_model": embedding_model,
+                "selected_embedding_models": selected_embedding_models,
+                "retrieval_strategy": retrieval_strategy,
+                "fusion_method": fusion_method,
+                "top_k": int(top_k),
+                "per_model_top_k": int(per_model_top_k),
+                "per_parser_top_k": int(per_parser_top_k),
+                "final_top_k": int(final_top_k),
+                "answer_model": answer_model,
+            },
+            "selected_by": "manual",
+            "selected_at": datetime.now(timezone.utc).isoformat(),
+            "notes": notes,
+        }
+        upsert_document_profile(profile)
+        st.success(f"Saved best profile for document_id `{document_id}`.")
+
+
+def render_saved_profiles() -> None:
+    st.markdown("### Saved Profiles")
+    profiles = load_document_profiles()
+    rows = saved_profile_rows(profiles)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No saved document profiles yet.")
+    with st.expander("Raw saved document_profiles.json", expanded=False):
+        st.json(profiles)
+
+
+def render_best_profile_manager_tab() -> None:
+    st.subheader("Best Profile Manager")
+    st.caption(
+        "Review generated answers from completed benchmark runs, then manually save the "
+        "document profile you want to use later."
+    )
+
+    benchmark_runs = list_benchmark_runs()
+    if not benchmark_runs:
+        st.info("No benchmark runs with run_config.yaml were found under outputs/runs/.")
+        render_saved_profiles()
+        return
+
+    run_labels = {
+        f"{run_id} ({run_config.get('experiment_type', 'unknown')})": (run_id, run_dir, run_config)
+        for run_id, run_dir, run_config in benchmark_runs
+    }
+    selected_label = st.selectbox(
+        "Benchmark run",
+        options=list(run_labels),
+        key="best_profile_run_selector",
+    )
+    selected_run_id, selected_run_dir, selected_run_config = run_labels[selected_label]
+
+    st.markdown("### Run Config Summary")
+    render_run_config_summary(selected_run_config)
+
+    answer_records, answer_warnings = load_answer_results_for_run(
+        selected_run_dir,
+        selected_run_config,
+    )
+    for warning in answer_warnings:
+        st.warning(warning)
+
+    grouped_answers = group_answers_by_question(answer_records)
+    if grouped_answers:
+        question_text_by_id = {
+            question_id: str(records[0].get("question", ""))
+            for question_id, records in grouped_answers.items()
+            if records
+        }
+        selected_question_id = st.selectbox(
+            "Question",
+            options=sorted(grouped_answers),
+            format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+            key=f"best_profile_question_{selected_run_id}",
+        )
+        selected_records = grouped_answers[selected_question_id]
+
+        st.markdown("### Selected Question")
+        st.write(
+            {
+                "question_id": selected_question_id,
+                "question": question_text_by_id.get(selected_question_id, "N/A"),
+            }
+        )
+
+        st.markdown("### Answer Comparison Table")
+        st.dataframe(
+            pd.DataFrame(answer_comparison_rows(selected_records)),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        st.markdown("### Answer Cases")
+        for case_record in selected_records:
+            render_answer_case(case_record)
+    else:
+        st.info("No generated answer results were found for this run.")
+
+    render_best_profile_form(selected_run_id, selected_run_config)
+    render_saved_profiles()
+
+    with st.expander("Raw run_config.yaml", expanded=False):
+        st.code(yaml.safe_dump(selected_run_config, sort_keys=False), language="yaml")
+    with st.expander("Raw answer result records for selected run", expanded=False):
+        st.json(answer_records)
+
+
 def parser_result_records(runner_result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     records_by_parser: dict[str, list[dict[str, Any]]] = {}
     for parser_id, result in runner_result.get("parser_results", {}).items():
@@ -2662,13 +3167,21 @@ def main() -> None:
     else:
         st.warning(f"Missing benchmark questions file: {BENCHMARK_QUESTIONS_PATH}")
 
-    parser_tab, chunking_tab, embedding_tab, retrieval_fusion_tab, parser_fusion_tab = st.tabs(
+    (
+        parser_tab,
+        chunking_tab,
+        embedding_tab,
+        retrieval_fusion_tab,
+        parser_fusion_tab,
+        best_profile_tab,
+    ) = st.tabs(
         [
             "Parser Compare",
             "Chunking Compare",
             "Embedding Compare",
             "Retrieval Fusion Compare",
             "Parser Fusion Compare",
+            "Best Profile Manager",
         ]
     )
 
@@ -2686,6 +3199,9 @@ def main() -> None:
 
     with parser_fusion_tab:
         render_parser_fusion_compare_tab(config)
+
+    with best_profile_tab:
+        render_best_profile_manager_tab()
 
 
 if __name__ == "__main__":
