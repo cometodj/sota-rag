@@ -987,6 +987,227 @@ def write_embedding_comparison_report(
     return csv_path, report_path
 
 
+def fused_chunk_from_candidate(
+    chunk: dict[str, Any],
+    final_rank: int,
+    fusion_score: float,
+    retrieved_by_models: list[str],
+    ranks_by_model: dict[str, int],
+) -> dict[str, Any]:
+    fused: dict[str, Any] = {
+        "final_rank": final_rank,
+        "rank": final_rank,
+        "chunk_id": str(chunk.get("chunk_id", "")),
+        "document_name": str(chunk.get("document_name", "")),
+        "chunk_index": chunk.get("chunk_index", ""),
+        "text": str(chunk.get("text", "")),
+        "fusion_score": fusion_score,
+        "retrieved_by_embedding_models": retrieved_by_models,
+        "original_ranks_by_model": ranks_by_model,
+    }
+    if chunk.get("page_number") not in (None, ""):
+        fused["page_number"] = chunk.get("page_number")
+    if chunk.get("section_title"):
+        fused["section_title"] = chunk.get("section_title")
+    return fused
+
+
+def fuse_retrieved_chunks(
+    retrieval_by_model: dict[str, list[dict[str, Any]]],
+    selected_models: list[str],
+    fusion_method: str,
+    final_top_k: int,
+    rrf_k: int = 60,
+) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    first_seen: dict[str, tuple[int, int]] = {}
+
+    for model_index, model_name in enumerate(selected_models):
+        for chunk in retrieval_by_model.get(model_name, []):
+            chunk_id = str(chunk.get("chunk_id", ""))
+            if not chunk_id:
+                continue
+            rank = int(chunk.get("rank", 10_000))
+            candidate = candidates.setdefault(
+                chunk_id,
+                {
+                    "chunk": chunk,
+                    "retrieved_by": [],
+                    "ranks_by_model": {},
+                    "rrf_score": 0.0,
+                },
+            )
+            if model_name not in candidate["retrieved_by"]:
+                candidate["retrieved_by"].append(model_name)
+            candidate["ranks_by_model"][model_name] = rank
+            candidate["rrf_score"] += 1 / (rrf_k + rank)
+            first_seen.setdefault(chunk_id, (model_index, rank))
+
+    if fusion_method == "union_dedup":
+        sorted_items = sorted(
+            candidates.items(),
+            key=lambda item: (
+                first_seen[item[0]][0],
+                first_seen[item[0]][1],
+                item[0],
+            ),
+        )
+    elif fusion_method == "rrf":
+        sorted_items = sorted(
+            candidates.items(),
+            key=lambda item: (
+                -float(item[1]["rrf_score"]),
+                min(item[1]["ranks_by_model"].values()),
+                item[0],
+            ),
+        )
+    else:
+        raise ValueError(f"Unsupported fusion method: {fusion_method}")
+
+    fused_chunks: list[dict[str, Any]] = []
+    for final_rank, (_chunk_id, candidate) in enumerate(sorted_items[:final_top_k], start=1):
+        fusion_score = (
+            float(len(candidate["retrieved_by"]))
+            if fusion_method == "union_dedup"
+            else float(candidate["rrf_score"])
+        )
+        fused_chunks.append(
+            fused_chunk_from_candidate(
+                chunk=candidate["chunk"],
+                final_rank=final_rank,
+                fusion_score=fusion_score,
+                retrieved_by_models=list(candidate["retrieved_by"]),
+                ranks_by_model=dict(candidate["ranks_by_model"]),
+            )
+        )
+    return fused_chunks
+
+
+def generate_fusion_answers(
+    fused_records: list[dict[str, Any]],
+    answer_model: str,
+) -> list[dict[str, Any]]:
+    answers: list[dict[str, Any]] = []
+    for record in fused_records:
+        answers.append(
+            {
+                "run_id": record["run_id"],
+                "experiment_type": record["experiment_type"],
+                "parser": record["parser"],
+                "chunking_strategy": record["chunking_strategy"],
+                "selected_embedding_models": record["selected_embedding_models"],
+                "fusion_method": record["fusion_method"],
+                "answer_model": answer_model,
+                "question_id": record["question_id"],
+                "question": record["question"],
+                "fused_chunks": record["fused_chunks"],
+                "generated_answer": generate_answer(
+                    question=str(record["question"]),
+                    chunks=record["fused_chunks"],
+                    answer_model=answer_model,
+                ),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    return answers
+
+
+def write_retrieval_fusion_comparison_report(
+    run_dir: Path,
+    fused_records: list[dict[str, Any]],
+    answer_records: list[dict[str, Any]],
+    model_warnings: dict[str, list[str]],
+) -> tuple[Path, Path]:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = reports_dir / "retrieval_fusion_comparison.csv"
+    report_path = reports_dir / "retrieval_fusion_comparison_report.md"
+    answers_by_question = {
+        str(record["question_id"]): record for record in answer_records
+    }
+
+    rows: list[dict[str, Any]] = []
+    for record in fused_records:
+        fused_chunks = record.get("fused_chunks", [])
+        answer_record = answers_by_question.get(str(record["question_id"]), {})
+        rows.append(
+            {
+                "question_id": record["question_id"],
+                "question": record["question"],
+                "fusion_method": record["fusion_method"],
+                "fused_chunk_count": len(fused_chunks),
+                "retrieved_locations": retrieved_locations(fused_chunks),
+                "retrieved_by_embedding_models": json.dumps(
+                    {
+                        chunk["chunk_id"]: chunk.get("retrieved_by_embedding_models", [])
+                        for chunk in fused_chunks
+                    },
+                    ensure_ascii=False,
+                ),
+                "answer_preview": preview_text(str(answer_record.get("generated_answer", ""))),
+            }
+        )
+
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        fieldnames = [
+            "question_id",
+            "question",
+            "fusion_method",
+            "fused_chunk_count",
+            "retrieved_locations",
+            "retrieved_by_embedding_models",
+            "answer_preview",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    lines = [
+        "# Retrieval Fusion Comparison Benchmark Report",
+        "",
+        "## Summary",
+        "",
+        f"- Questions compared: {len(fused_records)}",
+        f"- Fusion method: {fused_records[0]['fusion_method'] if fused_records else ''}",
+        "",
+        "This report is neutral and does not automatically claim fusion is better.",
+        "",
+        "## Embedding Model Warnings",
+    ]
+    for model_name, warnings in model_warnings.items():
+        lines.append(f"- {model_name}: {' | '.join(warnings) if warnings else 'none'}")
+
+    lines.extend(["", "## Per-Question Results"])
+    for row in rows:
+        lines.extend(
+            [
+                "",
+                f"### {row['question_id']}",
+                "",
+                f"Question: {row['question']}",
+                "",
+                f"- Fused chunks: {row['fused_chunk_count']}",
+                f"- Retrieved pages or sections: {row['retrieved_locations'] or 'none'}",
+                f"- Retrieved by embedding models: `{row['retrieved_by_embedding_models']}`",
+                f"- Answer preview: {row['answer_preview']}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Manual Review Notes",
+            "",
+            "- Review whether the fused chunks improve evidence coverage for each question.",
+            "- Check whether the generated answer is grounded only in fused chunks.",
+            "- Treat fusion as a retrieval candidate set, not an automatic quality claim.",
+            "- Do not use this report as an automatic recommendation.",
+        ]
+    )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, report_path
+
+
 def run_parser_compare(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
@@ -1563,6 +1784,256 @@ def run_embedding_compare(
     }
 
 
+def run_retrieval_fusion_compare(
+    run_config_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    config_path = Path(run_config_path)
+    run_config = read_yaml(config_path)
+    run_dir = config_path.parent
+    pdf_path = Path(run_config.get("uploaded_pdf_path") or run_config["pdf"]["saved_path"])
+    questions_config = run_config.get("benchmark_questions", {})
+    questions_path = Path(
+        run_config.get("benchmark_questions_path")
+        or questions_config.get("saved_path")
+        or questions_config["path"]
+    )
+
+    experiment_type = str(run_config.get("experiment_type", "retrieval_fusion_compare"))
+    if experiment_type != "retrieval_fusion_compare":
+        raise ValueError(
+            "run_retrieval_fusion_compare only supports "
+            f"experiment_type=retrieval_fusion_compare: {experiment_type}"
+        )
+
+    parser_id = str(run_config["parser"])
+    if parser_id not in SUPPORTED_PARSERS:
+        raise ValueError(f"Unsupported parser for runner: {parser_id}")
+
+    chunking_strategy = str(run_config["chunking_strategy"])
+    if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+        raise ValueError(f"Unsupported chunking strategy: {chunking_strategy}")
+
+    selected_models = [
+        str(model_name)
+        for model_name in run_config.get("selected_embedding_models", [])
+    ]
+    if len(selected_models) < 2:
+        raise ValueError("Retrieval Fusion Compare requires at least two selected embedding models.")
+
+    fusion_method = str(run_config["fusion_method"])
+    if fusion_method not in {"union_dedup", "rrf"}:
+        raise ValueError(f"Unsupported fusion method: {fusion_method}")
+
+    retrieval_strategy = str(run_config.get("retrieval_strategy", "dense_vector"))
+    if retrieval_strategy != "dense_vector":
+        raise ValueError(
+            "Retrieval Fusion Compare currently supports only retrieval_strategy='dense_vector'. "
+            f"Received: {retrieval_strategy}"
+        )
+
+    run_id = str(run_config["run_id"])
+    answer_model = str(run_config["answer_model"])
+    per_model_top_k = int(run_config["per_model_top_k"])
+    final_top_k = int(run_config["final_top_k"])
+    rrf_k = int(run_config.get("rrf_k", 60))
+    chunk_size = int(run_config.get("chunk_size", 800))
+    chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    questions = read_benchmark_questions(questions_path)
+    chroma_dir = run_dir / "chroma"
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(chroma_dir))
+    model_retrieval_records: dict[str, list[dict[str, Any]]] = {}
+    model_warnings: dict[str, list[str]] = {}
+
+    total_steps = 9
+    step = 0
+
+    def progress(message: str) -> None:
+        nonlocal step
+        step += 1
+        if progress_callback:
+            progress_callback(message, step, total_steps)
+        else:
+            print(f"[{step}/{total_steps}] {message}")
+
+    progress("Preparing run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    progress("Extracting document")
+    extracted_records, extraction_warnings = extract_document(parser_id, pdf_path, run_dir / "extraction")
+
+    progress("Chunking document")
+    chunks, chunk_warnings = create_chunks_for_strategy(
+        parser_id,
+        extracted_records,
+        chunking_strategy,
+        chunk_size,
+        chunk_overlap,
+    )
+    shared_warnings = extraction_warnings + chunk_warnings
+    chunks_dir = run_dir / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(chunks, chunks_dir / "chunks.jsonl")
+
+    progress("Running embedding models")
+    embedding_models: dict[str, BenchmarkEmbeddingModel | None] = {}
+    for model_name in selected_models:
+        try:
+            embedding_models[model_name] = BenchmarkEmbeddingModel(model_name)
+            model_warnings[model_name] = list(shared_warnings)
+        except Exception as exc:
+            embedding_models[model_name] = None
+            model_warnings[model_name] = list(shared_warnings) + [
+                f"Embedding model failed to load: {exc}"
+            ]
+
+    progress("Building vector DBs")
+    collections_by_model: dict[str, Any] = {}
+    for model_name, embedding_model in embedding_models.items():
+        safe_model_name = safe_embedding_model_name(model_name)
+        model_dir = run_dir / "embeddings" / safe_model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        if embedding_model is None:
+            continue
+        collection_name = make_strategy_collection_name(
+            run_id=run_id,
+            parser_id=parser_id,
+            chunking_strategy=chunking_strategy,
+            embedding_model_name=model_name,
+        )
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={
+                "parser": parser_id,
+                "embedding_model": model_name,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": retrieval_strategy,
+                "fusion_method": fusion_method,
+            },
+        )
+        try:
+            if chunks:
+                index_chunks(chunks, collection, embedding_model, parser_id)
+            collections_by_model[model_name] = collection
+        except Exception as exc:
+            model_warnings[model_name].append(f"Embedding/indexing failed: {exc}")
+            embedding_models[model_name] = None
+
+    progress("Running per-model retrieval")
+    for model_name in selected_models:
+        safe_model_name = safe_embedding_model_name(model_name)
+        model_dir = run_dir / "embeddings" / safe_model_name
+        embedding_model = embedding_models.get(model_name)
+        collection = collections_by_model.get(model_name)
+        if embedding_model is None or collection is None or not chunks:
+            retrieval_records = empty_retrieval_records(
+                questions,
+                run_id,
+                experiment_type,
+                parser_id,
+                chunking_strategy,
+                model_name,
+                per_model_top_k,
+            )
+        else:
+            retrieval_records = retrieve_questions(
+                questions=questions,
+                collection=collection,
+                embedding_model=embedding_model,
+                run_id=run_id,
+                experiment_type=experiment_type,
+                parser_id=parser_id,
+                chunking_strategy=chunking_strategy,
+                embedding_model_name=model_name,
+                top_k=per_model_top_k,
+            )
+        write_jsonl(retrieval_records, model_dir / "retrieval_results.jsonl")
+        model_retrieval_records[model_name] = retrieval_records
+
+    progress("Fusing retrieval results")
+    retrieval_by_question_and_model: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for model_name, records in model_retrieval_records.items():
+        for record in records:
+            question_id = str(record["question_id"])
+            retrieval_by_question_and_model.setdefault(question_id, {})[model_name] = record.get(
+                "retrieved_chunks",
+                [],
+            )
+
+    fused_records: list[dict[str, Any]] = []
+    for question in questions:
+        fused_chunks = fuse_retrieved_chunks(
+            retrieval_by_model=retrieval_by_question_and_model.get(question["id"], {}),
+            selected_models=selected_models,
+            fusion_method=fusion_method,
+            final_top_k=final_top_k,
+            rrf_k=rrf_k,
+        )
+        fused_records.append(
+            {
+                "run_id": run_id,
+                "experiment_type": experiment_type,
+                "parser": parser_id,
+                "chunking_strategy": chunking_strategy,
+                "selected_embedding_models": selected_models,
+                "fusion_method": fusion_method,
+                "question_id": question["id"],
+                "question": question["question"],
+                "per_model_top_k": per_model_top_k,
+                "final_top_k": final_top_k,
+                "fused_chunks": fused_chunks,
+            }
+        )
+
+    fusion_dir = run_dir / "fusion"
+    fusion_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(fused_records, fusion_dir / "fused_retrieval_results.jsonl")
+
+    progress("Generating answers")
+    answer_records = generate_fusion_answers(fused_records, answer_model)
+    write_jsonl(answer_records, fusion_dir / "answer_results.jsonl")
+
+    progress("Saving comparison report")
+    csv_path, report_path = write_retrieval_fusion_comparison_report(
+        run_dir,
+        fused_records,
+        answer_records,
+        model_warnings,
+    )
+
+    return {
+        "run_id": run_id,
+        "experiment_type": experiment_type,
+        "run_dir": str(run_dir),
+        "chroma_dir": str(chroma_dir),
+        "parser": parser_id,
+        "chunking_strategy": chunking_strategy,
+        "embedding_models": selected_models,
+        "fusion_method": fusion_method,
+        "reports": {
+            "retrieval_fusion_comparison_csv": str(csv_path),
+            "retrieval_fusion_comparison_report": str(report_path),
+        },
+        "model_warnings": model_warnings,
+        "per_model_results": {
+            model_name: {
+                "safe_model_name": safe_embedding_model_name(model_name),
+                "retrieval_results": str(
+                    run_dir / "embeddings" / safe_embedding_model_name(model_name) / "retrieval_results.jsonl"
+                ),
+            }
+            for model_name in selected_models
+        },
+        "fusion_results": {
+            "fused_retrieval_results": str(fusion_dir / "fused_retrieval_results.jsonl"),
+            "answer_results": str(fusion_dir / "answer_results.jsonl"),
+        },
+    }
+
+
 def run_benchmark_from_config(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
@@ -1575,6 +2046,8 @@ def run_benchmark_from_config(
         return run_chunking_compare(run_config_path, progress_callback=progress_callback)
     if experiment_type == "embedding_compare":
         return run_embedding_compare(run_config_path, progress_callback=progress_callback)
+    if experiment_type == "retrieval_fusion_compare":
+        return run_retrieval_fusion_compare(run_config_path, progress_callback=progress_callback)
     raise ValueError(f"Unsupported experiment_type for benchmark runner: {experiment_type}")
 
 

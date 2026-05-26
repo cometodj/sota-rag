@@ -1654,6 +1654,94 @@ def render_embedding_compare_results(runner_result: dict[str, Any]) -> None:
             )
 
 
+def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
+    st.subheader("Retrieval Fusion Compare Results")
+    st.write(
+        {
+            "run_id": runner_result.get("run_id"),
+            "run_dir": runner_result.get("run_dir"),
+            "chroma_dir": runner_result.get("chroma_dir"),
+            "parser": runner_result.get("parser"),
+            "chunking_strategy": runner_result.get("chunking_strategy"),
+            "fusion_method": runner_result.get("fusion_method"),
+            "reports": runner_result.get("reports"),
+        }
+    )
+
+    model_warnings = dict(runner_result.get("model_warnings", {}))
+    visible_warnings = {
+        model_name: warnings
+        for model_name, warnings in model_warnings.items()
+        if warnings
+    }
+    if visible_warnings:
+        st.warning("Some embedding models emitted warnings.")
+        st.write(visible_warnings)
+
+    fusion_results = dict(runner_result.get("fusion_results", {}))
+    fused_records, fused_error = read_jsonl(Path(str(fusion_results.get("fused_retrieval_results", ""))))
+    answer_records, answer_error = read_jsonl(Path(str(fusion_results.get("answer_results", ""))))
+    if fused_error:
+        st.warning(fused_error)
+    if answer_error:
+        st.warning(answer_error)
+    if not fused_records:
+        st.info("No fused retrieval results were found for this run.")
+        return
+
+    answers_by_question = {
+        str(record.get("question_id")): record for record in answer_records
+    }
+    question_ids = [str(record.get("question_id")) for record in fused_records]
+    question_text_by_id = {
+        str(record.get("question_id")): str(record.get("question", ""))
+        for record in fused_records
+    }
+    selected_question_id = st.selectbox(
+        "Question",
+        options=question_ids,
+        format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+        key=f"retrieval_fusion_result_question_{runner_result.get('run_id')}",
+    )
+    fused_record = next(
+        record for record in fused_records if str(record.get("question_id")) == selected_question_id
+    )
+    answer_record = answers_by_question.get(selected_question_id, {})
+
+    st.markdown("#### Generated Answer")
+    st.markdown(str(answer_record.get("generated_answer", "")))
+
+    st.markdown("#### Fused Chunks")
+    fused_chunks = fused_record.get("fused_chunks", [])
+    if not fused_chunks:
+        st.info("No fused chunks found for this question.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "final_rank": chunk.get("final_rank"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "page_number": chunk.get("page_number", ""),
+                    "section_title": chunk.get("section_title", ""),
+                    "fusion_score": chunk.get("fusion_score"),
+                    "retrieved_by_embedding_models": ", ".join(
+                        chunk.get("retrieved_by_embedding_models", [])
+                    ),
+                    "original_ranks_by_model": json.dumps(
+                        chunk.get("original_ranks_by_model", {}),
+                        ensure_ascii=False,
+                    ),
+                    "text_preview": preview_text(chunk.get("text", "")),
+                }
+                for chunk in fused_chunks
+            ]
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
 def render_parser_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Parser Compare")
     st.info(
@@ -1969,27 +2057,138 @@ def render_embedding_compare_tab(config: dict[str, Any]) -> None:
             render_embedding_compare_results(dict(st.session_state["last_embedding_compare_result"]))
 
 
-def render_retrieval_strategy_compare_tab() -> None:
-    st.subheader("Retrieval Strategy Compare")
+def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
+    st.subheader("Retrieval Fusion Compare")
     st.info(
-        "Coming soon. This will compare retrieval strategies while keeping parser, chunking, "
-        "embedding model, answer model, benchmark questions, and top_k fixed."
+        "Change only the retrieval fusion strategy over multiple embedding-model-specific vector DBs. "
+        "Parser, chunking strategy, answer model, benchmark questions, and final_top_k stay fixed."
     )
-    st.selectbox(
-        "Current retrieval strategy",
-        options=[DEFAULT_RETRIEVAL_STRATEGY],
-        key="retrieval_strategy_compare_current",
-        disabled=True,
+
+    _embedding_options, answer_options, _default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    default_embeddings = [
+        model for model in EMBEDDING_MODEL_OPTIONS[:2]
+    ]
+    uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="retrieval_fusion_pdf")
+    parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="retrieval_fusion_parser")
+    chunking_strategy = st.selectbox(
+        "Chunking strategy",
+        options=CHUNKING_STRATEGY_OPTIONS,
+        key="retrieval_fusion_chunking",
     )
-    st.button("Run Retrieval Strategy Benchmark", disabled=True)
+    selected_embedding_models = st.multiselect(
+        "Embedding models",
+        options=EMBEDDING_MODEL_OPTIONS,
+        default=default_embeddings,
+        key="retrieval_fusion_embedding_models",
+    )
+    fusion_method = st.selectbox(
+        "Fusion method",
+        options=["union_dedup", "rrf"],
+        key="retrieval_fusion_method",
+    )
+    answer_model = st.selectbox(
+        "Answer model",
+        options=answer_options,
+        index=default_index(answer_options, default_answer),
+        key="retrieval_fusion_answer",
+    )
+    per_model_top_k = st.number_input(
+        "per_model_top_k",
+        min_value=1,
+        max_value=100,
+        value=max(default_top_k, 10),
+        step=1,
+        key="retrieval_fusion_per_model_top_k",
+    )
+    final_top_k = st.number_input(
+        "final_top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="retrieval_fusion_final_top_k",
+    )
+    benchmark_questions, benchmark_questions_error = load_benchmark_questions_for_ui()
+    render_benchmark_questions_preview(benchmark_questions, benchmark_questions_error)
+
+    validation_errors = []
+    if len(selected_embedding_models) < 2:
+        validation_errors.append("Select at least two embedding models.")
+    if benchmark_questions_error:
+        validation_errors.append(benchmark_questions_error)
+    if int(per_model_top_k) < int(final_top_k):
+        st.warning("per_model_top_k is smaller than final_top_k; fused results may contain fewer final chunks.")
+    for error in validation_errors:
+        st.warning(error)
+
+    rendered_current_results = False
+    if st.button("Run Retrieval Fusion Benchmark", type="primary", key="run_retrieval_fusion"):
+        errors = validate_setup_inputs(uploaded_pdf, validation_errors)
+        if errors:
+            for error in errors:
+                st.warning(error)
+            return
+
+        run_config = setup_run_config("retrieval_fusion_compare", int(final_top_k))
+        run_config.update(
+            {
+                "parser": PARSER_ID_BY_LABEL[parser_label],
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
+                "selected_embedding_models": selected_embedding_models,
+                "fusion_method": fusion_method,
+                "answer_model": answer_model,
+                "per_model_top_k": int(per_model_top_k),
+                "final_top_k": int(final_top_k),
+                "rrf_k": 60,
+                "chunk_size": safe_int(
+                    config.get("chunking", {}).get("chunk_size"),
+                    default=800,
+                ),
+                "chunk_overlap": safe_int(
+                    config.get("chunking", {}).get("chunk_overlap"),
+                    default=150,
+                ),
+            }
+        )
+        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+        render_saved_run(run_id, run_dir, config_path, run_config)
+
+        progress_bar = st.progress(0)
+        with st.status("Running retrieval fusion benchmark", expanded=True) as status:
+            try:
+                from benchmark_runner import run_retrieval_fusion_compare
+
+                def update_progress(message: str, step: int, total: int) -> None:
+                    progress_bar.progress(step / total)
+                    st.write(message)
+
+                runner_result = run_retrieval_fusion_compare(
+                    config_path,
+                    progress_callback=update_progress,
+                )
+            except Exception as exc:
+                status.update(label="Retrieval fusion benchmark failed", state="error")
+                st.error(f"Retrieval fusion benchmark failed: {exc}")
+                return
+
+            status.update(label="Retrieval fusion benchmark complete", state="complete")
+
+        st.session_state["last_retrieval_fusion_result"] = runner_result
+        render_retrieval_fusion_results(runner_result)
+        rendered_current_results = True
+
+    if "last_retrieval_fusion_result" in st.session_state and not rendered_current_results:
+        with st.expander("Latest Retrieval Fusion Results", expanded=False):
+            render_retrieval_fusion_results(dict(st.session_state["last_retrieval_fusion_result"]))
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(
-        "Configure controlled benchmark runs. This UI saves uploaded PDFs and run_config.yaml files only; "
-        "no extraction, chunking, embedding, retrieval, answer generation, or query expansion is run."
+        "Configure and run controlled benchmark comparisons. Query expansion, judging, reranking, "
+        "and answer-model comparison are intentionally excluded."
     )
 
     config, config_error = load_config(CONFIG_PATH)
@@ -2001,12 +2200,12 @@ def main() -> None:
     else:
         st.warning(f"Missing benchmark questions file: {BENCHMARK_QUESTIONS_PATH}")
 
-    parser_tab, chunking_tab, embedding_tab, retrieval_strategy_tab = st.tabs(
+    parser_tab, chunking_tab, embedding_tab, retrieval_fusion_tab = st.tabs(
         [
             "Parser Compare",
             "Chunking Compare",
             "Embedding Compare",
-            "Retrieval Strategy Compare",
+            "Retrieval Fusion Compare",
         ]
     )
 
@@ -2019,8 +2218,8 @@ def main() -> None:
     with embedding_tab:
         render_embedding_compare_tab(config)
 
-    with retrieval_strategy_tab:
-        render_retrieval_strategy_compare_tab()
+    with retrieval_fusion_tab:
+        render_retrieval_fusion_compare_tab(config)
 
 
 if __name__ == "__main__":
