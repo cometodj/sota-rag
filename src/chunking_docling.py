@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from table_aware import add_table_metadata, extract_markdown_table_blocks
+
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
 DOCLING_EXTRACTED_FILENAME = "docling_extracted.jsonl"
@@ -90,9 +92,58 @@ def create_chunks(
         section_title = record.get("section_title")
         text = str(record.get("text", ""))
         chunk_start_index = per_document_chunk_counts.get(document_name, 0)
-        text_chunks = split_text(text, chunk_size, chunk_overlap)
+        table_blocks = extract_markdown_table_blocks(text)
+        table_ranges = {
+            (int(block["start_line"]), int(block["end_line"]))
+            for block in table_blocks
+        }
+        lines = text.splitlines()
 
-        for offset, chunk_text in enumerate(text_chunks):
+        text_segments: list[str] = []
+        cursor = 0
+        for start, end in sorted(table_ranges):
+            segment = "\n".join(lines[cursor:start]).strip()
+            if segment:
+                text_segments.append(segment)
+            cursor = end + 1
+        trailing_segment = "\n".join(lines[cursor:]).strip()
+        if trailing_segment:
+            text_segments.append(trailing_segment)
+
+        if not table_blocks:
+            text_segments = [text]
+
+        offset = 0
+        for segment in text_segments:
+            for chunk_text in split_text(segment, chunk_size, chunk_overlap):
+                chunk_index = chunk_start_index + offset
+                chunk = {
+                    "chunk_id": f"{document_name}:docling:r{record_index:04d}:c{offset:04d}",
+                    "document_name": document_name,
+                    "section_title": section_title,
+                    "chunk_index": chunk_index,
+                    "text": chunk_text,
+                    "char_count": len(chunk_text),
+                    "source": "docling",
+                }
+                add_table_metadata(chunk, source_parser="docling")
+                chunks.append(chunk)
+                offset += 1
+
+        for table_offset, table_block in enumerate(table_blocks):
+            table_markdown = str(table_block["table_markdown"])
+            nearby_context = str(table_block.get("nearby_context") or "")
+            caption = table_block.get("caption")
+            chunk_text = "\n\n".join(
+                part
+                for part in [
+                    f"Section: {section_title}" if section_title else "",
+                    f"Caption: {caption}" if caption else "",
+                    nearby_context,
+                    table_markdown,
+                ]
+                if part
+            )
             chunk_index = chunk_start_index + offset
             chunk = {
                 "chunk_id": f"{document_name}:docling:r{record_index:04d}:c{offset:04d}",
@@ -103,9 +154,18 @@ def create_chunks(
                 "char_count": len(chunk_text),
                 "source": "docling",
             }
+            add_table_metadata(
+                chunk,
+                source_parser="docling",
+                table_id=f"{document_name}:docling:r{record_index:04d}:t{table_offset:04d}",
+                table_markdown=table_markdown,
+                nearby_context=nearby_context,
+                caption=str(caption) if caption else None,
+            )
             chunks.append(chunk)
+            offset += 1
 
-        per_document_chunk_counts[document_name] = chunk_start_index + len(text_chunks)
+        per_document_chunk_counts[document_name] = chunk_start_index + offset
 
     return chunks
 

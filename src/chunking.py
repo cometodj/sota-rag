@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from table_aware import add_table_metadata
+
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
 EXTRACTED_PAGES_FILENAME = "extracted_pages.jsonl"
@@ -89,16 +91,17 @@ def create_chunks(
         text = str(page.get("text", ""))
 
         for chunk_index, chunk_text in enumerate(split_text(text, chunk_size, chunk_overlap)):
-            chunks.append(
-                {
-                    "chunk_id": f"{document_name}:p{page_number:04d}:c{chunk_index:04d}",
-                    "document_name": document_name,
-                    "page_number": page_number,
-                    "chunk_index": chunk_index,
-                    "text": chunk_text,
-                    "char_count": len(chunk_text),
-                }
-            )
+            chunk = {
+                "chunk_id": f"{document_name}:p{page_number:04d}:c{chunk_index:04d}",
+                "document_name": document_name,
+                "page_number": page_number,
+                "chunk_index": chunk_index,
+                "text": chunk_text,
+                "char_count": len(chunk_text),
+                "source": "pymupdf",
+            }
+            add_table_metadata(chunk, source_parser="pymupdf")
+            chunks.append(chunk)
 
     return chunks
 

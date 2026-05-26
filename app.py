@@ -954,19 +954,99 @@ def render_table_summary(chunks: list[dict[str, Any]]) -> None:
     )
 
 
+def table_like_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        chunk for chunk in chunks if table_chunk_label(chunk) in {"[Table Chunk]", "[Possible Table Chunk]"}
+    ]
+
+
+def chunk_source_parsers(chunk: dict[str, Any]) -> list[str]:
+    sources: list[str] = []
+    for key in ["retrieved_by_parsers", "parser_sources"]:
+        value = chunk.get(key)
+        if isinstance(value, list):
+            sources.extend(str(item) for item in value if item not in (None, ""))
+        elif value not in (None, ""):
+            sources.append(str(value))
+    for key in ["parser", "source_parser", "source"]:
+        value = chunk.get(key)
+        if value not in (None, ""):
+            sources.append(str(value))
+    return unique_preserve_order(sources)
+
+
+def summarize_table_evidence(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    confirmed = [chunk for chunk in chunks if table_chunk_label(chunk) == "[Table Chunk]"]
+    possible = [chunk for chunk in chunks if table_chunk_label(chunk) == "[Possible Table Chunk]"]
+    evidence_chunks = confirmed + possible
+    pages = {
+        str(chunk.get("page_number"))
+        for chunk in evidence_chunks
+        if chunk.get("page_number") not in (None, "")
+    }
+    chunk_ids = [
+        str(chunk.get("chunk_id"))
+        for chunk in evidence_chunks
+        if chunk.get("chunk_id") not in (None, "")
+    ]
+    source_parsers: list[str] = []
+    for chunk in evidence_chunks:
+        source_parsers.extend(chunk_source_parsers(chunk))
+
+    return {
+        "confirmed_table_chunks": len(confirmed),
+        "possible_table_chunks": len(possible),
+        "table_evidence_pages": ", ".join(sorted(pages, key=lambda value: safe_int(value, 0))) or "N/A",
+        "table_chunk_ids": ", ".join(chunk_ids) or "N/A",
+        "source_parsers": ", ".join(unique_preserve_order(source_parsers)) or "N/A",
+        "has_table_evidence": bool(evidence_chunks),
+        "has_table_markdown": any(chunk.get("table_markdown") for chunk in evidence_chunks),
+    }
+
+
+def render_table_evidence_summary(chunks: list[dict[str, Any]]) -> None:
+    summary = summarize_table_evidence(chunks)
+    st.markdown(
+        "\n".join(
+            [
+                f"- Confirmed table chunks: {summary['confirmed_table_chunks']}",
+                f"- Possible table chunks: {summary['possible_table_chunks']}",
+                f"- Table evidence pages: {summary['table_evidence_pages']}",
+                f"- Table chunk IDs: {summary['table_chunk_ids']}",
+                f"- Source parsers: {summary['source_parsers']}",
+            ]
+        )
+    )
+    if summary["has_table_evidence"] and not summary["has_table_markdown"]:
+        st.warning("Table evidence was detected, but table_markdown is not available. Showing raw text fallback.")
+
+
+def render_parser_fusion_table_diagnostics_section(
+    title: str,
+    chunks: list[dict[str, Any]],
+    fused: bool = False,
+) -> None:
+    with st.expander(title, expanded=False):
+        render_table_evidence_summary(chunks)
+        evidence_chunks = table_like_chunks(chunks)
+        if not evidence_chunks:
+            st.info("No table-like evidence detected in this result set.")
+            return
+        for chunk in evidence_chunks:
+            render_table_chunk_card(chunk, fused=fused)
+
+
 def table_markdown_for_chunk(chunk: dict[str, Any]) -> str:
     return str(chunk.get("table_markdown") or chunk.get("markdown_table") or chunk.get("text") or "")
 
 
 def render_table_chunk_details(chunks: list[dict[str, Any]]) -> None:
-    table_like_chunks = [
-        chunk for chunk in chunks if table_chunk_label(chunk) in {"[Table Chunk]", "[Possible Table Chunk]"}
-    ]
-    if not table_like_chunks:
+    evidence_chunks = table_like_chunks(chunks)
+    if not evidence_chunks:
         return
 
     st.markdown("##### Table Chunk Details")
-    for index, chunk in enumerate(table_like_chunks, start=1):
+    for index, chunk in enumerate(evidence_chunks, start=1):
         label = table_chunk_label(chunk)
         chunk_id = str(chunk.get("chunk_id", f"chunk-{index}"))
         caption = chunk.get("caption") or chunk.get("table_caption") or "No caption"
@@ -1011,12 +1091,14 @@ def render_chunk_table(
     chunks: list[dict[str, Any]],
     empty_message: str,
     highlight_ids: set[str] | None = None,
+    show_table_summary: bool = True,
 ) -> None:
     if not chunks:
         st.info(empty_message)
         return
 
-    render_table_summary(chunks)
+    if show_table_summary:
+        render_table_summary(chunks)
     st.dataframe(
         chunk_rows(chunks, highlight_ids=highlight_ids),
         hide_index=True,
@@ -1776,6 +1858,164 @@ def parser_fusion_chunk_rows(chunks: list[dict[str, Any]], fused: bool = False) 
     return pd.DataFrame(rows)
 
 
+def parser_fusion_chunk_metadata(chunk: dict[str, Any], fused: bool) -> dict[str, Any]:
+    metadata = {
+        "chunk_type": table_chunk_label(chunk),
+        "chunk_id": first_present(chunk, ["chunk_id"]),
+        "rank": first_present(chunk, ["final_rank", "rank"]),
+        "parser/source": display_value(chunk_source_parsers(chunk)),
+        "page_number": first_present(chunk, ["page_number"]),
+        "section_title": first_present(chunk, ["section_title"]),
+        "caption": first_present(chunk, ["caption", "table_caption"]),
+        "score/distance/fusion_score": first_present(
+            chunk,
+            ["fusion_score", "score", "distance", "similarity"],
+        ),
+    }
+    if fused:
+        metadata.update(
+            {
+                "retrieved_by_parsers": display_value(
+                    first_present(chunk, ["retrieved_by_parsers"], [])
+                ),
+                "parser_sources": display_value(first_present(chunk, ["parser_sources"], [])),
+                "original_ranks_by_parser": display_value(
+                    first_present(chunk, ["original_ranks_by_parser"], {})
+                ),
+            }
+        )
+    return metadata
+
+
+def render_table_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
+    label = table_chunk_label(chunk)
+    rank = first_present(chunk, ["final_rank", "rank"], "N/A")
+    chunk_id = first_present(chunk, ["chunk_id"], "N/A")
+    title = f"{label} rank {rank} - {chunk_id}"
+    with st.expander(title, expanded=label == "[Table Chunk]"):
+        st.write(parser_fusion_chunk_metadata(chunk, fused=fused))
+
+        table_markdown = chunk.get("table_markdown") or chunk.get("markdown_table")
+        table_json = chunk.get("table_json") or chunk.get("raw_table_json")
+        text = str(chunk.get("text") or "")
+
+        if table_markdown:
+            st.markdown("##### Table Content")
+            st.markdown(str(table_markdown))
+            with st.expander("Table Content Source", expanded=False):
+                st.code(str(table_markdown), language="markdown")
+        elif text:
+            st.markdown("##### Table-like Text Content")
+            st.code(text)
+        else:
+            st.info("No table_markdown or text content is available for this chunk.")
+
+        if table_json:
+            with st.expander("Raw Table JSON", expanded=False):
+                st.json(table_json)
+
+        with st.expander("Nearby Context", expanded=False):
+            nearby_context = chunk.get("nearby_context") or chunk.get("parent_context")
+            if nearby_context:
+                st.markdown(str(nearby_context))
+            else:
+                st.write("N/A")
+
+        with st.expander("Raw Chunk JSON", expanded=False):
+            st.json(chunk)
+
+
+def answer_table_evidence_records(answer_record: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not answer_record:
+        return []
+    explicit_evidence = answer_record.get("table_evidence_used")
+    if isinstance(explicit_evidence, list):
+        return [item for item in explicit_evidence if isinstance(item, dict)]
+
+    chunks = answer_record.get("fused_chunks") or answer_record.get("retrieved_chunks") or []
+    if not isinstance(chunks, list):
+        return []
+
+    evidence: list[dict[str, Any]] = []
+    for chunk in table_like_chunks([item for item in chunks if isinstance(item, dict)]):
+        table_markdown = chunk.get("table_markdown")
+        preview_source = table_markdown or chunk.get("text") or ""
+        evidence_record = {
+            "chunk_id": chunk.get("chunk_id", ""),
+            "chunk_type": table_chunk_label(chunk).strip("[]"),
+            "page_number": chunk.get("page_number", ""),
+            "section_title": chunk.get("section_title", ""),
+            "source_parser": ", ".join(chunk_source_parsers(chunk)),
+            "caption": chunk.get("caption", chunk.get("table_caption", "")),
+            "raw_chunk": chunk,
+        }
+        if chunk.get("final_rank") not in (None, ""):
+            evidence_record["final_rank"] = chunk.get("final_rank")
+        elif chunk.get("rank") not in (None, ""):
+            evidence_record["rank"] = chunk.get("rank")
+        if table_markdown:
+            evidence_record["table_markdown_preview"] = preview_text(preview_source, limit=360)
+        else:
+            evidence_record["text_preview"] = preview_text(preview_source, limit=360)
+        evidence.append(evidence_record)
+    return evidence
+
+
+def render_table_evidence_used(answer_record: dict[str, Any] | None) -> None:
+    evidence_records = answer_table_evidence_records(answer_record)
+    with st.expander("Table Evidence Used in Answer", expanded=False):
+        if not evidence_records:
+            st.info("No table evidence was recorded or detected for this answer.")
+            return
+        rows = [
+            {
+                "chunk_id": record.get("chunk_id", "N/A"),
+                "chunk_type": record.get("chunk_type", "N/A"),
+                "page_number": record.get("page_number", "N/A"),
+                "section_title": record.get("section_title", "N/A"),
+                "source_parser": record.get("source_parser", "N/A"),
+                "rank": record.get("final_rank", record.get("rank", "N/A")),
+                "caption": record.get("caption", "N/A"),
+                "table_markdown_preview": record.get(
+                    "table_markdown_preview",
+                    record.get("text_preview", ""),
+                ),
+            }
+            for record in evidence_records
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        for record in evidence_records:
+            chunk_id = record.get("chunk_id", "N/A")
+            with st.expander(f"Raw table evidence JSON - {chunk_id}", expanded=False):
+                st.json(record)
+
+
+def render_text_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
+    rank = first_present(chunk, ["final_rank", "rank"], "N/A")
+    chunk_id = first_present(chunk, ["chunk_id"], "N/A")
+    with st.expander(f"[Text Chunk] rank {rank} - {chunk_id}", expanded=False):
+        st.write(parser_fusion_chunk_metadata(chunk, fused=fused))
+        st.markdown("##### Text Preview")
+        st.write(preview_text(chunk.get("text", "")))
+        with st.expander("Raw Chunk JSON", expanded=False):
+            st.json(chunk)
+
+
+def render_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
+    if table_chunk_label(chunk) in {"[Table Chunk]", "[Possible Table Chunk]"}:
+        render_table_chunk_card(chunk, fused=fused)
+    else:
+        render_text_chunk_card(chunk, fused=fused)
+
+
+def render_parser_fusion_chunk_cards(chunks: list[dict[str, Any]], fused: bool = False) -> None:
+    if not chunks:
+        return
+    st.markdown("##### Evidence Cards")
+    for chunk in chunks:
+        render_chunk_card(chunk, fused=fused)
+
+
 def render_parser_fusion_chunk_table(
     title: str,
     record: dict[str, Any] | None,
@@ -1783,7 +2023,11 @@ def render_parser_fusion_chunk_table(
 ) -> None:
     st.markdown(f"#### {title}")
     chunks = record_chunks(record, fused=fused)
-    render_chunk_table(chunks, "No chunks found for this question.")
+    render_chunk_table(
+        chunks,
+        "No chunks found for this question.",
+        show_table_summary=False,
+    )
 
 
 def render_raw_json_expander(title: str, record: dict[str, Any] | None) -> None:
@@ -1887,7 +2131,30 @@ def render_parser_fusion_existing_results_browser() -> None:
     with columns[1]:
         render_parser_fusion_chunk_table("Docling Only", docling_record)
     with columns[2]:
-        render_parser_fusion_chunk_table("Parser Fusion Final Top-K", fused_record, fused=True)
+        render_parser_fusion_chunk_table("Fused Final Top-K", fused_record, fused=True)
+
+    st.markdown("#### Table Evidence Diagnostics")
+    st.caption(
+        "This section shows table-like evidence found within the selected question's retrieval results. "
+        "It is diagnostic information, not a separate table-aware benchmark."
+    )
+    diagnostics_columns = st.columns(3)
+    with diagnostics_columns[0]:
+        render_parser_fusion_table_diagnostics_section(
+            "PyMuPDF table evidence",
+            record_chunks(pymupdf_record),
+        )
+    with diagnostics_columns[1]:
+        render_parser_fusion_table_diagnostics_section(
+            "Docling table evidence",
+            record_chunks(docling_record),
+        )
+    with diagnostics_columns[2]:
+        render_parser_fusion_table_diagnostics_section(
+            "Fused final top-k table evidence",
+            record_chunks(fused_record, fused=True),
+            fused=True,
+        )
 
     st.markdown("#### Generated Answer")
     if answer_record is None:
@@ -1895,6 +2162,7 @@ def render_parser_fusion_existing_results_browser() -> None:
     else:
         st.caption(f"Answer model: `{answer_record.get('answer_model', 'N/A')}`")
         st.markdown(str(answer_record.get("generated_answer") or "N/A"))
+        render_table_evidence_used(answer_record)
         evidence = answer_record.get("evidence_used") or answer_record.get("evidence")
         if evidence:
             st.markdown("##### Evidence Used")
@@ -2174,6 +2442,7 @@ def render_answer_case(case_record: dict[str, Any]) -> None:
     st.write(make_answer_preview(case_record.get("generated_answer", "")))
     with st.expander("Full generated answer", expanded=False):
         st.markdown(str(case_record.get("generated_answer") or "N/A"))
+    render_table_evidence_used(case_record)
     with st.expander("Retrieved or fused chunks", expanded=False):
         chunks = answer_context_chunks(case_record)
         if chunks:
@@ -2496,6 +2765,7 @@ def render_parser_compare_results(runner_result: dict[str, Any]) -> None:
 
             st.markdown("##### Generated Answer")
             st.markdown(str(record.get("generated_answer", "")))
+            render_table_evidence_used(record)
             st.markdown("##### Retrieved Chunks")
             render_chunk_table(
                 record.get("retrieved_chunks", []),
@@ -2587,6 +2857,7 @@ def render_chunking_compare_results(runner_result: dict[str, Any]) -> None:
 
             st.markdown("##### Generated Answer")
             st.markdown(str(record.get("generated_answer", "")))
+            render_table_evidence_used(record)
             st.markdown("##### Retrieved Chunks")
             render_chunk_table(
                 record.get("retrieved_chunks", []),
@@ -2679,6 +2950,7 @@ def render_embedding_compare_results(runner_result: dict[str, Any]) -> None:
 
             st.markdown("##### Generated Answer")
             st.markdown(str(record.get("generated_answer", "")))
+            render_table_evidence_used(record)
             st.markdown("##### Retrieved Chunks")
             render_chunk_table(
                 record.get("retrieved_chunks", []),
@@ -2742,6 +3014,7 @@ def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
 
     st.markdown("#### Generated Answer")
     st.markdown(str(answer_record.get("generated_answer", "")))
+    render_table_evidence_used(answer_record)
 
     st.markdown("#### Fused Chunks")
     fused_chunks = fused_record.get("fused_chunks", [])
@@ -2804,6 +3077,7 @@ def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
 
     st.markdown("#### Generated Answer")
     st.markdown(str(answer_record.get("generated_answer", "")))
+    render_table_evidence_used(answer_record)
 
     st.markdown("#### Fused Chunks")
     fused_chunks = fused_record.get("fused_chunks", [])

@@ -12,6 +12,14 @@ from embeddings import EmbeddingModel
 
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
+TABLE_METADATA_KEYS = [
+    "chunk_type",
+    "table_id",
+    "table_markdown",
+    "nearby_context",
+    "caption",
+    "source_parser",
+]
 ORIGINAL_OUTPUT_FILENAME = "original_retrieval_results.jsonl"
 EXPANDED_OUTPUT_FILENAME = "expanded_retrieval_results.jsonl"
 DOCLING_ORIGINAL_OUTPUT_FILENAME = "original_retrieval_results_docling.jsonl"
@@ -146,6 +154,10 @@ def format_retrieved_chunks(query_result: dict[str, Any]) -> list[dict[str, Any]
             chunk["page_number"] = int(metadata["page_number"])
         if "section_title" in metadata:
             chunk["section_title"] = str(metadata["section_title"])
+        for key in TABLE_METADATA_KEYS:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                chunk[key] = value
 
         if distances:
             chunk["distance"] = distances[index]

@@ -10,12 +10,21 @@ import chromadb
 import yaml
 
 from embeddings import EmbeddingModel
+from table_aware import classify_chunk_text
 
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
 CHUNKS_FILENAME = "chunks.jsonl"
 DOCLING_CHUNKS_FILENAME = "chunks_docling.jsonl"
 BATCH_SIZE = 128
+TABLE_METADATA_KEYS = [
+    "chunk_type",
+    "table_id",
+    "table_markdown",
+    "nearby_context",
+    "caption",
+    "source_parser",
+]
 SUPPORTED_SOURCES = {"pymupdf", "docling"}
 
 
@@ -100,13 +109,21 @@ def get_collection(
 
 
 def pymupdf_chunk_metadata(chunk: dict[str, Any]) -> dict[str, str | int]:
-    return {
+    metadata: dict[str, str | int] = {
         "chunk_id": str(chunk["chunk_id"]),
         "document_name": str(chunk["document_name"]),
         "page_number": int(chunk["page_number"]),
         "chunk_index": int(chunk["chunk_index"]),
         "char_count": int(chunk["char_count"]),
+        "chunk_type": str(chunk.get("chunk_type") or classify_chunk_text(str(chunk.get("text", "")))),
+        "source_parser": str(chunk.get("source_parser") or "pymupdf"),
     }
+    for key in TABLE_METADATA_KEYS:
+        value = chunk.get(key)
+        if key in metadata or value in (None, ""):
+            continue
+        metadata[key] = str(value)
+    return metadata
 
 
 def docling_chunk_metadata(chunk: dict[str, Any]) -> dict[str, str | int]:
@@ -116,11 +133,18 @@ def docling_chunk_metadata(chunk: dict[str, Any]) -> dict[str, str | int]:
         "chunk_index": int(chunk["chunk_index"]),
         "char_count": int(chunk["char_count"]),
         "source": "docling",
+        "chunk_type": str(chunk.get("chunk_type") or classify_chunk_text(str(chunk.get("text", "")))),
+        "source_parser": str(chunk.get("source_parser") or "docling"),
     }
 
     section_title = chunk.get("section_title")
     if section_title:
         metadata["section_title"] = str(section_title)
+    for key in TABLE_METADATA_KEYS:
+        value = chunk.get(key)
+        if key in metadata or value in (None, ""):
+            continue
+        metadata[key] = str(value)
 
     return metadata
 

@@ -13,11 +13,47 @@ from typing import Any
 
 import yaml
 
+from table_aware import add_table_metadata, classify_chunk_text, is_possible_table_text
+
 
 BATCH_SIZE = 128
 SUPPORTED_PARSERS = {"pymupdf", "docling"}
-SUPPORTED_CHUNKING_STRATEGIES = {"fixed-size", "page-based", "section-aware"}
+SUPPORTED_CHUNKING_STRATEGIES = {
+    "fixed-size",
+    "page-based",
+    "section-aware",
+    "table-aware",
+    "parent-child table context",
+}
 ProgressCallback = Callable[[str, int, int], None]
+TABLE_METADATA_KEYS = [
+    "chunk_type",
+    "table_id",
+    "table_markdown",
+    "nearby_context",
+    "caption",
+    "source_parser",
+]
+
+
+def default_table_handling() -> dict[str, bool]:
+    return {
+        "detect_tables": True,
+        "preserve_table_markdown": True,
+        "include_full_table_context": True,
+        "include_nearby_context": True,
+        "include_table_json": False,
+        "use_parent_child_table_context": False,
+    }
+
+
+def normalized_table_handling(table_handling: dict[str, Any] | None = None) -> dict[str, bool]:
+    config = default_table_handling()
+    if isinstance(table_handling, dict):
+        for key in config:
+            if key in table_handling:
+                config[key] = bool(table_handling[key])
+    return config
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
@@ -154,6 +190,8 @@ def chunk_metadata(chunk: dict[str, Any], parser_id: str) -> dict[str, str | int
         "chunk_index": int(chunk["chunk_index"]),
         "char_count": int(chunk["char_count"]),
         "parser": parser_id,
+        "chunk_type": str(chunk.get("chunk_type") or classify_chunk_text(str(chunk.get("text", "")))),
+        "source_parser": str(chunk.get("source_parser") or parser_id),
     }
 
     if "page_number" in chunk:
@@ -162,6 +200,11 @@ def chunk_metadata(chunk: dict[str, Any], parser_id: str) -> dict[str, str | int
         metadata["section_title"] = str(chunk["section_title"])
     if chunk.get("source"):
         metadata["source"] = str(chunk["source"])
+    for key in TABLE_METADATA_KEYS:
+        value = chunk.get(key)
+        if key in metadata or value in (None, ""):
+            continue
+        metadata[key] = str(value)
 
     return metadata
 
@@ -202,6 +245,10 @@ def format_retrieved_chunks(query_result: dict[str, Any]) -> list[dict[str, Any]
             chunk["page_number"] = metadata["page_number"]
         if "section_title" in metadata:
             chunk["section_title"] = metadata["section_title"]
+        for key in TABLE_METADATA_KEYS:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                chunk[key] = value
         if distances:
             chunk["distance"] = distances[index]
 
@@ -279,21 +326,135 @@ def evidence_label(chunk: dict[str, Any]) -> str:
         parts.append(f"page_number={chunk.get('page_number')}")
     if chunk.get("section_title"):
         parts.append(f"section_title={chunk.get('section_title')}")
+    if chunk.get("chunk_type"):
+        parts.append(f"chunk_type={chunk.get('chunk_type')}")
+    if chunk.get("caption"):
+        parts.append(f"caption={chunk.get('caption')}")
     return ", ".join(parts)
 
 
-def build_answer_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
-    context = "\n\n---\n\n".join(
-        f"[{evidence_label(chunk)}]\n{chunk.get('text', '')}" for chunk in chunks
+def source_parser_for_chunk(chunk: dict[str, Any]) -> str:
+    for key in ["source_parser", "parser", "source"]:
+        value = chunk.get(key)
+        if value not in (None, ""):
+            return str(value)
+    parser_sources = chunk.get("parser_sources") or chunk.get("retrieved_by_parsers")
+    if isinstance(parser_sources, list) and parser_sources:
+        return ", ".join(str(value) for value in parser_sources)
+    return ""
+
+
+def chunk_rank(chunk: dict[str, Any]) -> Any:
+    return chunk.get("final_rank", chunk.get("rank", ""))
+
+
+def effective_chunk_type(chunk: dict[str, Any], table_handling: dict[str, bool]) -> str:
+    chunk_type = str(chunk.get("chunk_type") or chunk.get("content_type") or "").casefold()
+    if chunk_type in {"table", "possible_table"}:
+        return chunk_type
+    if table_handling["detect_tables"] and is_possible_table_text(str(chunk.get("text", ""))):
+        return "possible_table"
+    return "text"
+
+
+def answer_context_text(chunk: dict[str, Any], table_handling: dict[str, bool]) -> str:
+    chunk_type = effective_chunk_type(chunk, table_handling)
+    parts: list[str] = []
+    header = [
+        f"Rank: {chunk_rank(chunk)}" if chunk_rank(chunk) not in (None, "") else "",
+        f"Chunk ID: {chunk.get('chunk_id', '')}",
+        f"Source parser: {source_parser_for_chunk(chunk)}" if source_parser_for_chunk(chunk) else "",
+        f"Page: {chunk.get('page_number')}" if chunk.get("page_number") not in (None, "") else "",
+    ]
+    parts.append("\n".join(item for item in header if item))
+    if chunk.get("section_title"):
+        parts.append(f"Section: {chunk['section_title']}")
+    if chunk.get("caption"):
+        parts.append(f"Caption: {chunk['caption']}")
+
+    if chunk_type == "table":
+        if table_handling["include_nearby_context"] and chunk.get("nearby_context"):
+            parts.append(f"Nearby context:\n{chunk['nearby_context']}")
+        if table_handling["include_table_json"] and chunk.get("table_json"):
+            parts.append(f"Raw table JSON:\n{json.dumps(chunk['table_json'], ensure_ascii=False)}")
+        table_text = (
+            chunk.get("table_markdown")
+            if table_handling["include_full_table_context"]
+            else None
+        ) or chunk.get("text", "")
+        parts.append(f"Table evidence:\n{table_text}")
+    elif chunk_type == "possible_table":
+        if table_handling["include_nearby_context"] and chunk.get("nearby_context"):
+            parts.append(f"Nearby context:\n{chunk['nearby_context']}")
+        parts.append(str(chunk.get("text", "")))
+    else:
+        parts.append(str(chunk.get("text", "")))
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def build_answer_context(
+    chunks: list[dict[str, Any]],
+    table_handling: dict[str, Any] | None = None,
+) -> str:
+    handling = normalized_table_handling(table_handling)
+    return "\n\n---\n\n".join(
+        f"[{evidence_label(chunk)}]\n{answer_context_text(chunk, handling)}" for chunk in chunks
     )
+
+
+def table_evidence_used(
+    chunks: list[dict[str, Any]],
+    table_handling: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    handling = normalized_table_handling(table_handling)
+    evidence: list[dict[str, Any]] = []
+    for chunk in chunks:
+        chunk_type = effective_chunk_type(chunk, handling)
+        if chunk_type not in {"table", "possible_table"}:
+            continue
+        has_table_markdown = chunk.get("table_markdown") not in (None, "")
+        preview_source = chunk.get("table_markdown") if has_table_markdown else chunk.get("text", "")
+        item = {
+            "chunk_id": chunk.get("chunk_id", ""),
+            "chunk_type": chunk_type,
+            "page_number": chunk.get("page_number", ""),
+            "section_title": chunk.get("section_title", ""),
+            "source_parser": source_parser_for_chunk(chunk),
+        }
+        if chunk.get("final_rank") not in (None, ""):
+            item["final_rank"] = chunk.get("final_rank")
+        elif chunk.get("rank") not in (None, ""):
+            item["rank"] = chunk.get("rank")
+        if has_table_markdown:
+            item["table_markdown_preview"] = preview_text(str(preview_source), limit=360)
+        else:
+            item["text_preview"] = preview_text(str(preview_source), limit=360)
+        if chunk.get("caption"):
+            item["caption"] = chunk["caption"]
+        evidence.append(item)
+    return evidence
+
+
+def build_answer_prompt(
+    question: str,
+    chunks: list[dict[str, Any]],
+    table_handling: dict[str, Any] | None = None,
+) -> str:
+    context = build_answer_context(chunks, table_handling)
     return f"""You answer technical-document questions using only retrieved chunks.
 
 Rules:
 - Use only the retrieved context below.
 - Do not use outside knowledge.
 - Do not hallucinate fields, values, sections, or requirements.
+- Pay special attention to table evidence.
+- If a table lists values, preserve the value-to-description relationship.
+- Do not invent table values.
+- Do not infer values that are not in the table.
+- If table evidence is insufficient or unclear, say so clearly.
 - If the retrieved chunks are insufficient, say so clearly.
 - Keep the answer concise and technical.
+- In Evidence Used, mention table chunk IDs, page numbers, section titles, and parser/source when available.
 
 Question:
 {question}
@@ -303,16 +464,24 @@ Retrieved context:
 
 Return exactly these sections:
 ## Answer Summary
+## Table Values / Field Values Used
 ## Evidence Used
 ## Missing or Uncertain Information
 """
 
 
-def generate_answer(question: str, chunks: list[dict[str, Any]], answer_model: str) -> str:
+def generate_answer(
+    question: str,
+    chunks: list[dict[str, Any]],
+    answer_model: str,
+    table_handling: dict[str, Any] | None = None,
+) -> str:
     if not chunks:
         return (
             "## Answer Summary\n"
             "The retrieved context is insufficient because no chunks were retrieved.\n\n"
+            "## Table Values / Field Values Used\n"
+            "- None\n\n"
             "## Evidence Used\n"
             "- None\n\n"
             "## Missing or Uncertain Information\n"
@@ -323,7 +492,7 @@ def generate_answer(question: str, chunks: list[dict[str, Any]], answer_model: s
 
     response = ollama.generate(
         model=answer_model,
-        prompt=build_answer_prompt(question, chunks),
+        prompt=build_answer_prompt(question, chunks, table_handling),
         options={"temperature": 0.1},
     )
     return str(response["response"]).strip()
@@ -332,9 +501,11 @@ def generate_answer(question: str, chunks: list[dict[str, Any]], answer_model: s
 def generate_answers(
     retrieval_records: list[dict[str, Any]],
     answer_model: str,
+    table_handling: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     answers: list[dict[str, Any]] = []
     for record in retrieval_records:
+        chunks = record["retrieved_chunks"]
         answers.append(
             {
                 "run_id": record["run_id"],
@@ -345,11 +516,13 @@ def generate_answers(
                 "answer_model": answer_model,
                 "question_id": record["question_id"],
                 "question": record["question"],
-                "retrieved_chunks": record["retrieved_chunks"],
+                "retrieved_chunks": chunks,
+                "table_evidence_used": table_evidence_used(chunks, table_handling),
                 "generated_answer": generate_answer(
                     question=str(record["question"]),
-                    chunks=record["retrieved_chunks"],
+                    chunks=chunks,
                     answer_model=answer_model,
+                    table_handling=table_handling,
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -412,6 +585,19 @@ def chunk_record(
         chunk["section_title"] = str(source_record["section_title"])
     if source_record.get("source"):
         chunk["source"] = str(source_record["source"])
+    source_parser = str(
+        source_record.get("source")
+        or source_record.get("source_parser")
+        or ("pymupdf" if source_record.get("page_number") not in (None, "") else "unknown")
+    )
+    add_table_metadata(
+        chunk,
+        source_parser=source_parser,
+        table_id=str(source_record["table_id"]) if source_record.get("table_id") else None,
+        table_markdown=str(source_record["table_markdown"]) if source_record.get("table_markdown") else None,
+        nearby_context=str(source_record["nearby_context"]) if source_record.get("nearby_context") else None,
+        caption=str(source_record["caption"]) if source_record.get("caption") else None,
+    )
     return chunk
 
 
@@ -556,7 +742,7 @@ def create_chunks_for_strategy(
     output_strategy = force_strategy_name or chunking_strategy
     warnings: list[str] = []
 
-    if chunking_strategy == "fixed-size":
+    if chunking_strategy in {"fixed-size", "table-aware", "parent-child table context"}:
         if parser_id == "pymupdf":
             from chunking import create_chunks as create_pymupdf_chunks
 
@@ -569,6 +755,14 @@ def create_chunks_for_strategy(
             chunk["chunk_id"] = f"{chunk['document_name']}:{slugify(output_strategy)}:c{index:04d}"
             chunk["chunk_index"] = index
             chunk["chunking_strategy"] = output_strategy
+            chunk["source_parser"] = parser_id
+            if "chunk_type" not in chunk:
+                add_table_metadata(chunk, source_parser=parser_id)
+        if chunking_strategy == "parent-child table context":
+            warnings.append(
+                "parent-child table context currently stores table nearby_context metadata when available; "
+                "hierarchical child-to-parent retrieval is not implemented yet."
+            )
         return chunks, warnings
 
     if chunking_strategy == "page-based":
@@ -1009,6 +1203,10 @@ def fused_chunk_from_candidate(
         fused["page_number"] = chunk.get("page_number")
     if chunk.get("section_title"):
         fused["section_title"] = chunk.get("section_title")
+    for key in TABLE_METADATA_KEYS:
+        value = chunk.get(key)
+        if value not in (None, ""):
+            fused[key] = value
     return fused
 
 
@@ -1086,9 +1284,11 @@ def fuse_retrieved_chunks(
 def generate_fusion_answers(
     fused_records: list[dict[str, Any]],
     answer_model: str,
+    table_handling: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     answers: list[dict[str, Any]] = []
     for record in fused_records:
+        chunks = record["fused_chunks"]
         answers.append(
             {
                 "run_id": record["run_id"],
@@ -1100,11 +1300,13 @@ def generate_fusion_answers(
                 "answer_model": answer_model,
                 "question_id": record["question_id"],
                 "question": record["question"],
-                "fused_chunks": record["fused_chunks"],
+                "fused_chunks": chunks,
+                "table_evidence_used": table_evidence_used(chunks, table_handling),
                 "generated_answer": generate_answer(
                     question=str(record["question"]),
-                    chunks=record["fused_chunks"],
+                    chunks=chunks,
                     answer_model=answer_model,
+                    table_handling=table_handling,
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -1135,6 +1337,10 @@ def fused_parser_chunk_from_candidate(
         fused["page_number"] = chunk.get("page_number")
     if chunk.get("section_title"):
         fused["section_title"] = chunk.get("section_title")
+    for key in TABLE_METADATA_KEYS:
+        value = chunk.get(key)
+        if value not in (None, ""):
+            fused[key] = value
     return fused
 
 
@@ -1212,9 +1418,11 @@ def fuse_parser_chunks(
 def generate_parser_fusion_answers(
     fused_records: list[dict[str, Any]],
     answer_model: str,
+    table_handling: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     answers: list[dict[str, Any]] = []
     for record in fused_records:
+        chunks = record["fused_chunks"]
         answers.append(
             {
                 "run_id": record["run_id"],
@@ -1226,11 +1434,13 @@ def generate_parser_fusion_answers(
                 "answer_model": answer_model,
                 "question_id": record["question_id"],
                 "question": record["question"],
-                "fused_chunks": record["fused_chunks"],
+                "fused_chunks": chunks,
+                "table_evidence_used": table_evidence_used(chunks, table_handling),
                 "generated_answer": generate_answer(
                     question=str(record["question"]),
-                    chunks=record["fused_chunks"],
+                    chunks=chunks,
                     answer_model=answer_model,
+                    table_handling=table_handling,
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -1487,6 +1697,7 @@ def run_parser_compare(
     top_k = int(run_config["top_k"])
     chunk_size = int(run_config.get("chunk_size", 800))
     chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    table_handling = normalized_table_handling(run_config.get("table_handling"))
     questions = read_benchmark_questions(questions_path)
     chroma_dir = run_dir / "chroma"
     import chromadb
@@ -1584,7 +1795,11 @@ def run_parser_compare(
     progress("Generating answers")
     for parser_id, result in parser_results.items():
         parser_dir = run_dir / parser_id
-        answer_records = generate_answers(result["retrieval_records"], answer_model)
+        answer_records = generate_answers(
+            result["retrieval_records"],
+            answer_model,
+            table_handling=table_handling,
+        )
         write_jsonl(answer_records, parser_dir / "answer_results.jsonl")
         result["answer_records"] = answer_records
 
@@ -1605,6 +1820,7 @@ def run_parser_compare(
             parser_id: {
                 "collection_name": result["collection_name"],
                 "chunk_count": result["chunk_count"],
+                "chunks": str(run_dir / parser_id / "chunks.jsonl"),
                 "retrieval_results": str(run_dir / parser_id / "retrieval_results.jsonl"),
                 "answer_results": str(run_dir / parser_id / "answer_results.jsonl"),
             }
@@ -1666,6 +1882,7 @@ def run_chunking_compare(
     top_k = int(run_config["top_k"])
     chunk_size = int(run_config.get("chunk_size", 800))
     chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    table_handling = normalized_table_handling(run_config.get("table_handling"))
     questions = read_benchmark_questions(questions_path)
     chroma_dir = run_dir / "chroma"
 
@@ -1773,7 +1990,11 @@ def run_chunking_compare(
     progress("Generating answers")
     for strategy, result in strategy_results.items():
         strategy_dir = run_dir / strategy
-        answer_records = generate_answers(result["retrieval_records"], answer_model)
+        answer_records = generate_answers(
+            result["retrieval_records"],
+            answer_model,
+            table_handling=table_handling,
+        )
         write_jsonl(answer_records, strategy_dir / "answer_results.jsonl")
         result["answer_records"] = answer_records
 
@@ -1852,6 +2073,7 @@ def run_embedding_compare(
     top_k = int(run_config["top_k"])
     chunk_size = int(run_config.get("chunk_size", 800))
     chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    table_handling = normalized_table_handling(run_config.get("table_handling"))
     questions = read_benchmark_questions(questions_path)
     chroma_dir = run_dir / "chroma"
 
@@ -1983,7 +2205,11 @@ def run_embedding_compare(
     progress("Generating answers")
     for model_name, result in model_results.items():
         model_dir = run_dir / "embeddings" / str(result["safe_model_name"])
-        answer_records = generate_answers(result["retrieval_records"], answer_model)
+        answer_records = generate_answers(
+            result["retrieval_records"],
+            answer_model,
+            table_handling=table_handling,
+        )
         write_jsonl(answer_records, model_dir / "answer_results.jsonl")
         result["answer_records"] = answer_records
 
@@ -1998,6 +2224,7 @@ def run_embedding_compare(
         "parser": parser_id,
         "chunking_strategy": chunking_strategy,
         "embedding_models": selected_models,
+        "chunks": str(chunks_dir / "chunks.jsonl"),
         "reports": {
             "embedding_comparison_csv": str(csv_path),
             "embedding_comparison_report": str(report_path),
@@ -2075,6 +2302,7 @@ def run_retrieval_fusion_compare(
     rrf_k = int(run_config.get("rrf_k", 60))
     chunk_size = int(run_config.get("chunk_size", 800))
     chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    table_handling = normalized_table_handling(run_config.get("table_handling"))
     questions = read_benchmark_questions(questions_path)
     chroma_dir = run_dir / "chroma"
 
@@ -2229,7 +2457,11 @@ def run_retrieval_fusion_compare(
     write_jsonl(fused_records, fusion_dir / "fused_retrieval_results.jsonl")
 
     progress("Generating answers")
-    answer_records = generate_fusion_answers(fused_records, answer_model)
+    answer_records = generate_fusion_answers(
+        fused_records,
+        answer_model,
+        table_handling=table_handling,
+    )
     write_jsonl(answer_records, fusion_dir / "answer_results.jsonl")
 
     progress("Saving comparison report")
@@ -2249,6 +2481,7 @@ def run_retrieval_fusion_compare(
         "chunking_strategy": chunking_strategy,
         "embedding_models": selected_models,
         "fusion_method": fusion_method,
+        "chunks": str(chunks_dir / "chunks.jsonl"),
         "reports": {
             "retrieval_fusion_comparison_csv": str(csv_path),
             "retrieval_fusion_comparison_report": str(report_path),
@@ -2315,6 +2548,7 @@ def run_parser_fusion_compare(
     rrf_k = int(run_config.get("rrf_k", 60))
     chunk_size = int(run_config.get("chunk_size", 800))
     chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    table_handling = normalized_table_handling(run_config.get("table_handling"))
     questions = read_benchmark_questions(questions_path)
     chroma_dir = run_dir / "chroma"
 
@@ -2457,7 +2691,11 @@ def run_parser_fusion_compare(
     write_jsonl(fused_records, fusion_dir / "fused_retrieval_results.jsonl")
 
     progress("Generating answers")
-    answer_records = generate_parser_fusion_answers(fused_records, answer_model)
+    answer_records = generate_parser_fusion_answers(
+        fused_records,
+        answer_model,
+        table_handling=table_handling,
+    )
     write_jsonl(answer_records, fusion_dir / "answer_results.jsonl")
 
     progress("Saving comparison report")
@@ -2488,6 +2726,7 @@ def run_parser_fusion_compare(
                 "collection_name": collection_names_by_parser[parser_id],
                 "chunk_count": len(chunks_by_parser[parser_id]),
                 "warnings": warnings_by_parser[parser_id],
+                "chunks": str(run_dir / parser_id / "chunks.jsonl"),
                 "retrieval_results": str(run_dir / parser_id / "retrieval_results.jsonl"),
             }
             for parser_id in selected_parsers
