@@ -1907,11 +1907,11 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
     embedding_options, answer_options, default_embedding, default_answer, default_top_k = benchmark_defaults(config)
     uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="chunking_compare_pdf")
     parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="chunking_compare_parser")
-    selected_chunking_strategies = st.multiselect(
+    selected_chunking_strategies = selected_options_from_checkboxes(
         "Chunking strategies",
-        options=CHUNKING_STRATEGY_OPTIONS,
-        default=["fixed-size", "page-based"],
-        key="chunking_compare_strategies",
+        CHUNKING_STRATEGY_OPTIONS,
+        ["fixed-size", "page-based"],
+        "chunking_compare_strategy",
     )
     embedding_model = st.selectbox(
         "Embedding model",
@@ -1996,11 +1996,11 @@ def render_embedding_compare_tab(config: dict[str, Any]) -> None:
         options=CHUNKING_STRATEGY_OPTIONS,
         key="embedding_compare_chunking",
     )
-    selected_embedding_models = st.multiselect(
+    selected_embedding_models = selected_options_from_checkboxes(
         "Embedding models",
-        options=EMBEDDING_MODEL_OPTIONS,
-        default=default_embeddings,
-        key="embedding_compare_models",
+        EMBEDDING_MODEL_OPTIONS,
+        default_embeddings,
+        "embedding_compare_model",
     )
     answer_model = st.selectbox(
         "Answer model",
@@ -2078,11 +2078,11 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
         options=CHUNKING_STRATEGY_OPTIONS,
         key="retrieval_fusion_chunking",
     )
-    selected_embedding_models = st.multiselect(
+    selected_embedding_models = selected_options_from_checkboxes(
         "Embedding models",
-        options=EMBEDDING_MODEL_OPTIONS,
-        default=default_embeddings,
-        key="retrieval_fusion_embedding_models",
+        EMBEDDING_MODEL_OPTIONS,
+        default_embeddings,
+        "retrieval_fusion_embedding_model",
     )
     fusion_method = st.selectbox(
         "Fusion method",
