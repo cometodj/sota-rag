@@ -884,20 +884,31 @@ def chunk_rows(chunks: list[dict[str, Any]], highlight_ids: set[str] | None = No
 
 
 def is_possible_table_chunk(text: Any) -> bool:
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    normalized_text = str(text or "")
+    lines = [line.strip() for line in normalized_text.splitlines() if line.strip()]
     table_lines = [line for line in lines if line.startswith("|") and line.endswith("|")]
     if len(table_lines) >= 2:
         return True
-    return any(re.search(r"\|\s*:?-{3,}:?\s*\|", line) for line in lines)
+    if normalized_text.count("|") >= 4:
+        return True
+    if any(re.search(r"\|\s*:?-{3,}:?\s*\|", line) for line in lines):
+        return True
+    table_terms = ["Value", "Description", "Bit", "Bits", "Field", "Fields", "Reserved"]
+    term_count = sum(1 for term in table_terms if re.search(rf"\b{re.escape(term)}\b", normalized_text))
+    return term_count >= 2
 
 
-def table_chunk_label(chunk: dict[str, Any]) -> str:
+def get_chunk_type_label(chunk: dict[str, Any]) -> str:
     chunk_type = str(chunk.get("chunk_type") or chunk.get("content_type") or "").casefold()
     if chunk_type == "table":
         return "[Table Chunk]"
     if chunk.get("contains_table") is True or is_possible_table_chunk(chunk.get("text", "")):
         return "[Possible Table Chunk]"
     return "[Text Chunk]"
+
+
+def table_chunk_label(chunk: dict[str, Any]) -> str:
+    return get_chunk_type_label(chunk)
 
 
 def count_table_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -923,8 +934,24 @@ def count_table_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
         "table_chunks": table_chunks,
         "possible_table_chunks": possible_table_chunks,
         "text_chunks": text_chunks,
-        "pages_containing_table_evidence": ", ".join(sorted(table_pages, key=lambda value: safe_int(value, 0))) or "N/A",
+        "table_evidence_pages": ", ".join(sorted(table_pages, key=lambda value: safe_int(value, 0))) or "N/A",
     }
+
+
+def render_table_summary(chunks: list[dict[str, Any]]) -> None:
+    summary = count_table_chunks(chunks)
+    st.markdown("##### Table-aware Summary")
+    st.markdown(
+        "\n".join(
+            [
+                f"- Total retrieved chunks: {summary['total_retrieved_chunks']}",
+                f"- Table chunks: {summary['table_chunks']}",
+                f"- Possible table chunks: {summary['possible_table_chunks']}",
+                f"- Text chunks: {summary['text_chunks']}",
+                f"- Table evidence pages: {summary['table_evidence_pages']}",
+            ]
+        )
+    )
 
 
 def table_markdown_for_chunk(chunk: dict[str, Any]) -> str:
@@ -965,7 +992,7 @@ def render_table_chunk_details(chunks: list[dict[str, Any]]) -> None:
                 if nearby_context:
                     st.markdown(str(nearby_context))
                 else:
-                    st.info("No nearby_context field is available for this chunk.")
+                    st.write("N/A")
             with st.expander("Show raw chunk JSON", expanded=False):
                 st.json(chunk)
 
@@ -989,7 +1016,7 @@ def render_chunk_table(
         st.info(empty_message)
         return
 
-    st.write(count_table_chunks(chunks))
+    render_table_summary(chunks)
     st.dataframe(
         chunk_rows(chunks, highlight_ids=highlight_ids),
         hide_index=True,
