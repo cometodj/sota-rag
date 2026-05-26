@@ -1424,6 +1424,11 @@ def render_result_area(run_dir: Path, experiment_type: str) -> None:
             run_dir / "fusion" / "answer_results.jsonl",
             run_dir / "reports" / "retrieval_fusion_comparison_report.md",
         ],
+        "parser_fusion_compare": [
+            run_dir / "parser_fusion" / "fused_retrieval_results.jsonl",
+            run_dir / "parser_fusion" / "answer_results.jsonl",
+            run_dir / "reports" / "parser_fusion_comparison_report.md",
+        ],
     }
     existing_paths = [
         path for path in result_paths_by_experiment.get(experiment_type, []) if path.exists()
@@ -1463,6 +1468,266 @@ def save_configured_run(
     render_placeholder_status()
     render_saved_run(run_id, run_dir, config_path, run_config)
     render_result_area(run_dir, experiment_type)
+
+
+def load_run_config(run_dir: Path) -> tuple[dict[str, Any], str | None]:
+    config_path = run_dir / "run_config.yaml"
+    if not config_path.exists():
+        return {}, f"Missing run_config.yaml: {config_path}"
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        return {}, f"Could not read run_config.yaml: {exc}"
+    if not isinstance(config, dict):
+        return {}, f"run_config.yaml must contain a mapping: {config_path}"
+    return config, None
+
+
+def list_parser_fusion_runs() -> list[tuple[str, Path, dict[str, Any]]]:
+    if not RUNS_DIR.exists():
+        return []
+
+    runs: list[tuple[str, Path, dict[str, Any]]] = []
+    for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        run_config, error = load_run_config(run_dir)
+        if error:
+            continue
+        if run_config.get("experiment_type") == "parser_fusion_compare":
+            runs.append((run_dir.name, run_dir, run_config))
+    return runs
+
+
+def load_jsonl_records(path: Path) -> tuple[list[dict[str, Any]], str | None]:
+    return read_jsonl(path)
+
+
+def question_id_value(record: dict[str, Any]) -> str:
+    return str(record.get("question_id") or record.get("id") or "")
+
+
+def find_record_by_question_id(
+    records: list[dict[str, Any]],
+    question_id: str,
+) -> dict[str, Any] | None:
+    for record in records:
+        if question_id_value(record) == question_id:
+            return record
+    return None
+
+
+def record_chunks(record: dict[str, Any] | None, fused: bool = False) -> list[dict[str, Any]]:
+    if not record:
+        return []
+    if fused:
+        chunks = record.get("fused_chunks") or record.get("retrieved_chunks") or record.get("chunks") or []
+    else:
+        chunks = record.get("retrieved_chunks") or record.get("chunks") or []
+    return chunks if isinstance(chunks, list) else []
+
+
+def first_present(mapping: dict[str, Any], keys: list[str], default: Any = "N/A") -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def display_value(value: Any) -> str:
+    if value in (None, ""):
+        return "N/A"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def parser_fusion_chunk_rows(chunks: list[dict[str, Any]], fused: bool = False) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        if fused:
+            rows.append(
+                {
+                    "final_rank": first_present(chunk, ["final_rank", "rank"], index),
+                    "chunk_id": first_present(chunk, ["chunk_id"]),
+                    "retrieved_by_parsers": display_value(
+                        first_present(chunk, ["retrieved_by_parsers"], [])
+                    ),
+                    "original_ranks_by_parser": display_value(
+                        first_present(chunk, ["original_ranks_by_parser"], {})
+                    ),
+                    "parser_sources": display_value(first_present(chunk, ["parser_sources"], [])),
+                    "page_number": first_present(chunk, ["page_number"]),
+                    "section_title": first_present(chunk, ["section_title"]),
+                    "fusion_score": first_present(chunk, ["fusion_score", "score", "distance", "similarity"]),
+                    "text_preview": preview_text(first_present(chunk, ["text"], "")),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "rank": first_present(chunk, ["rank"], index),
+                    "chunk_id": first_present(chunk, ["chunk_id"]),
+                    "page_number": first_present(chunk, ["page_number"]),
+                    "section_title": first_present(chunk, ["section_title"]),
+                    "chunk_index": first_present(chunk, ["chunk_index"]),
+                    "score_or_distance": first_present(
+                        chunk,
+                        ["score", "distance", "similarity"],
+                    ),
+                    "text_preview": preview_text(first_present(chunk, ["text"], "")),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def render_parser_fusion_chunk_table(
+    title: str,
+    record: dict[str, Any] | None,
+    fused: bool = False,
+) -> None:
+    st.markdown(f"#### {title}")
+    chunks = record_chunks(record, fused=fused)
+    if not chunks:
+        st.info("No chunks found for this question.")
+        return
+    st.dataframe(
+        parser_fusion_chunk_rows(chunks, fused=fused),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def render_raw_json_expander(title: str, record: dict[str, Any] | None) -> None:
+    with st.expander(title, expanded=False):
+        if record is None:
+            st.info("No record found.")
+        else:
+            st.json(record)
+
+
+def render_parser_fusion_existing_results_browser() -> None:
+    st.markdown("### Existing Parser Fusion Results")
+    parser_fusion_runs = list_parser_fusion_runs()
+    if not parser_fusion_runs:
+        st.info("No parser_fusion_compare runs were found under outputs/runs/.")
+        return
+
+    run_lookup = {run_id: (run_dir, run_config) for run_id, run_dir, run_config in parser_fusion_runs}
+    selected_run_id = st.selectbox(
+        "Parser Fusion run_id",
+        options=list(run_lookup),
+        key="parser_fusion_existing_run",
+    )
+    run_dir, run_config = run_lookup[selected_run_id]
+
+    paths = {
+        "PyMuPDF retrieval file missing": run_dir / "pymupdf" / "retrieval_results.jsonl",
+        "Docling retrieval file missing": run_dir / "docling" / "retrieval_results.jsonl",
+        "Fused retrieval file missing": run_dir / "parser_fusion" / "fused_retrieval_results.jsonl",
+        "Answer results file missing": run_dir / "parser_fusion" / "answer_results.jsonl",
+        "Report file missing": run_dir / "reports" / "parser_fusion_comparison_report.md",
+    }
+    for warning, path in paths.items():
+        if not path.exists():
+            st.warning(f"{warning}: `{path}`")
+
+    pymupdf_records, pymupdf_error = load_jsonl_records(paths["PyMuPDF retrieval file missing"])
+    docling_records, docling_error = load_jsonl_records(paths["Docling retrieval file missing"])
+    fused_records, fused_error = load_jsonl_records(paths["Fused retrieval file missing"])
+    answer_records, answer_error = load_jsonl_records(paths["Answer results file missing"])
+    for error in [pymupdf_error, docling_error, fused_error, answer_error]:
+        if error:
+            st.warning(error)
+
+    question_ids = sorted(
+        {
+            question_id_value(record)
+            for record in fused_records + answer_records
+            if question_id_value(record)
+        }
+    )
+    if not question_ids:
+        st.info("No question records were found in fused retrieval or answer results.")
+        return
+
+    question_text_by_id = {
+        question_id_value(record): str(record.get("question", ""))
+        for record in fused_records + answer_records
+        if question_id_value(record)
+    }
+    selected_question_id = st.selectbox(
+        "Question",
+        options=question_ids,
+        format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+        key=f"parser_fusion_existing_question_{selected_run_id}",
+    )
+
+    st.markdown("#### Run Configuration")
+    st.write(
+        {
+            "experiment_type": run_config.get("experiment_type", "N/A"),
+            "selected_parsers": run_config.get("selected_parsers", "N/A"),
+            "chunking_strategy": run_config.get("chunking_strategy", "N/A"),
+            "embedding_model": run_config.get("embedding_model", "N/A"),
+            "fusion_method": run_config.get("fusion_method", "N/A"),
+            "answer_model": run_config.get("answer_model", "N/A"),
+            "per_parser_top_k": run_config.get("per_parser_top_k", "N/A"),
+            "final_top_k": run_config.get("final_top_k", "N/A"),
+            "benchmark_questions_path": run_config.get("benchmark_questions_path", "N/A"),
+        }
+    )
+
+    fused_record = find_record_by_question_id(fused_records, selected_question_id)
+    answer_record = find_record_by_question_id(answer_records, selected_question_id)
+    pymupdf_record = find_record_by_question_id(pymupdf_records, selected_question_id)
+    docling_record = find_record_by_question_id(docling_records, selected_question_id)
+    question_text = (
+        (fused_record or {}).get("question")
+        or (answer_record or {}).get("question")
+        or (pymupdf_record or {}).get("question")
+        or (docling_record or {}).get("question")
+        or "N/A"
+    )
+
+    st.markdown("#### Selected Question")
+    st.write({"question_id": selected_question_id, "question": question_text})
+
+    columns = st.columns(3)
+    with columns[0]:
+        render_parser_fusion_chunk_table("PyMuPDF Only", pymupdf_record)
+    with columns[1]:
+        render_parser_fusion_chunk_table("Docling Only", docling_record)
+    with columns[2]:
+        render_parser_fusion_chunk_table("Parser Fusion Final Top-K", fused_record, fused=True)
+
+    st.markdown("#### Generated Answer")
+    if answer_record is None:
+        st.info("No answer record found for this question.")
+    else:
+        st.caption(f"Answer model: `{answer_record.get('answer_model', 'N/A')}`")
+        st.markdown(str(answer_record.get("generated_answer") or "N/A"))
+        evidence = answer_record.get("evidence_used") or answer_record.get("evidence")
+        if evidence:
+            st.markdown("##### Evidence Used")
+            st.write(evidence)
+
+    with st.expander("Parser Fusion Report", expanded=False):
+        report_path = paths["Report file missing"]
+        if report_path.exists():
+            report_markdown, report_error = read_markdown(report_path)
+            if report_error:
+                st.warning(report_error)
+            else:
+                st.markdown(report_markdown)
+        else:
+            st.info("Report file is not available for this run.")
+
+    render_raw_json_expander("Raw PyMuPDF record", pymupdf_record)
+    render_raw_json_expander("Raw Docling record", docling_record)
+    render_raw_json_expander("Raw fused retrieval record", fused_record)
+    render_raw_json_expander("Raw answer record", answer_record)
 
 
 def parser_result_records(runner_result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -1801,6 +2066,93 @@ def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
                         chunk.get("original_ranks_by_model", {}),
                         ensure_ascii=False,
                     ),
+                    "text_preview": preview_text(chunk.get("text", "")),
+                }
+                for chunk in fused_chunks
+            ]
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
+    st.subheader("Parser Fusion Compare Results")
+    st.write(
+        {
+            "run_id": runner_result.get("run_id"),
+            "run_dir": runner_result.get("run_dir"),
+            "chroma_dir": runner_result.get("chroma_dir"),
+            "selected_parsers": runner_result.get("selected_parsers"),
+            "chunking_strategy": runner_result.get("chunking_strategy"),
+            "embedding_model": runner_result.get("embedding_model"),
+            "fusion_method": runner_result.get("fusion_method"),
+            "reports": runner_result.get("reports"),
+        }
+    )
+
+    parser_warnings = {
+        parser_id: warnings
+        for parser_id, warnings in dict(runner_result.get("parser_warnings", {})).items()
+        if warnings
+    }
+    if parser_warnings:
+        st.warning("Some parsers emitted warnings.")
+        st.write(parser_warnings)
+
+    fusion_results = dict(runner_result.get("fusion_results", {}))
+    fused_records, fused_error = read_jsonl(Path(str(fusion_results.get("fused_retrieval_results", ""))))
+    answer_records, answer_error = read_jsonl(Path(str(fusion_results.get("answer_results", ""))))
+    if fused_error:
+        st.warning(fused_error)
+    if answer_error:
+        st.warning(answer_error)
+    if not fused_records:
+        st.info("No fused parser retrieval results were found for this run.")
+        return
+
+    answers_by_question = {
+        str(record.get("question_id")): record for record in answer_records
+    }
+    question_ids = [str(record.get("question_id")) for record in fused_records]
+    question_text_by_id = {
+        str(record.get("question_id")): str(record.get("question", ""))
+        for record in fused_records
+    }
+    selected_question_id = st.selectbox(
+        "Question",
+        options=question_ids,
+        format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+        key=f"parser_fusion_result_question_{runner_result.get('run_id')}",
+    )
+    fused_record = next(
+        record for record in fused_records if str(record.get("question_id")) == selected_question_id
+    )
+    answer_record = answers_by_question.get(selected_question_id, {})
+
+    st.markdown("#### Generated Answer")
+    st.markdown(str(answer_record.get("generated_answer", "")))
+
+    st.markdown("#### Fused Chunks")
+    fused_chunks = fused_record.get("fused_chunks", [])
+    if not fused_chunks:
+        st.info("No fused chunks found for this question.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "final_rank": chunk.get("final_rank"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "page_number": chunk.get("page_number", ""),
+                    "section_title": chunk.get("section_title", ""),
+                    "fusion_score": chunk.get("fusion_score"),
+                    "retrieved_by_parsers": ", ".join(chunk.get("retrieved_by_parsers", [])),
+                    "original_ranks_by_parser": json.dumps(
+                        chunk.get("original_ranks_by_parser", {}),
+                        ensure_ascii=False,
+                    ),
+                    "parser_sources": ", ".join(chunk.get("parser_sources", [])),
                     "text_preview": preview_text(chunk.get("text", "")),
                 }
                 for chunk in fused_chunks
@@ -2159,12 +2511,146 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
         save_configured_run(run_config, uploaded_pdf, "retrieval_fusion_compare")
 
 
+def render_parser_fusion_compare_tab(config: dict[str, Any]) -> None:
+    st.subheader("Parser Fusion Compare")
+    render_experiment_context(
+        variable="parser retrieval strategy",
+        fixed=[
+            "chunking_strategy",
+            "embedding_model",
+            "answer_model",
+            "benchmark_questions_path",
+            "final_top_k",
+            "retrieval_strategy",
+        ],
+    )
+    render_parser_fusion_existing_results_browser()
+    st.markdown("### Configure New Parser Fusion Run")
+
+    _embedding_options, answer_options, _default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    uploaded_pdf = st.file_uploader("PDF upload", type=["pdf"], key="parser_fusion_pdf")
+    selected_parsers = selected_parser_ids_from_checkboxes("parser_fusion_parser")
+    chunking_strategy = st.selectbox(
+        "Chunking strategy",
+        options=CHUNKING_STRATEGY_OPTIONS,
+        key="parser_fusion_chunking",
+    )
+    embedding_model = st.selectbox(
+        "Embedding model",
+        options=EMBEDDING_MODEL_OPTIONS,
+        key="parser_fusion_embedding",
+    )
+    fusion_method = st.selectbox(
+        "Fusion method",
+        options=["union_dedup", "rrf"],
+        key="parser_fusion_method",
+    )
+    answer_model = st.selectbox(
+        "Answer model",
+        options=answer_options,
+        index=default_index(answer_options, default_answer),
+        key="parser_fusion_answer",
+    )
+    per_parser_top_k = st.number_input(
+        "per_parser_top_k",
+        min_value=1,
+        max_value=100,
+        value=max(default_top_k, 10),
+        step=1,
+        key="parser_fusion_per_parser_top_k",
+    )
+    final_top_k = st.number_input(
+        "final_top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="parser_fusion_final_top_k",
+    )
+    benchmark_questions, benchmark_questions_error = load_benchmark_questions_for_ui()
+    render_benchmark_questions_preview(benchmark_questions, benchmark_questions_error)
+
+    validation_errors = []
+    if len(selected_parsers) < 2:
+        validation_errors.append("Select at least two parsers.")
+    if benchmark_questions_error:
+        validation_errors.append(benchmark_questions_error)
+    if int(final_top_k) > int(per_parser_top_k) * max(len(selected_parsers), 1):
+        st.warning(
+            "final_top_k is larger than per_parser_top_k multiplied by the number of selected parsers; "
+            "fused results may contain fewer final chunks."
+        )
+    for error in validation_errors:
+        st.warning(error)
+
+    rendered_current_results = False
+    if st.button("Run Parser Fusion Benchmark", type="primary", key="run_parser_fusion"):
+        errors = validate_setup_inputs(uploaded_pdf, validation_errors)
+        if errors:
+            for error in errors:
+                st.warning(error)
+            return
+
+        run_config = setup_run_config("parser_fusion_compare", int(final_top_k))
+        run_config.update(
+            {
+                "selected_parsers": selected_parsers,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": "parser_fusion",
+                "embedding_model": embedding_model,
+                "fusion_method": fusion_method,
+                "answer_model": answer_model,
+                "per_parser_top_k": int(per_parser_top_k),
+                "final_top_k": int(final_top_k),
+                "rrf_k": 60,
+                "chunk_size": safe_int(
+                    config.get("chunking", {}).get("chunk_size"),
+                    default=800,
+                ),
+                "chunk_overlap": safe_int(
+                    config.get("chunking", {}).get("chunk_overlap"),
+                    default=150,
+                ),
+            }
+        )
+        run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+        render_saved_run(run_id, run_dir, config_path, run_config)
+
+        progress_bar = st.progress(0)
+        with st.status("Running parser fusion benchmark", expanded=True) as status:
+            try:
+                from benchmark_runner import run_parser_fusion_compare
+
+                def update_progress(message: str, step: int, total: int) -> None:
+                    progress_bar.progress(step / total)
+                    st.write(message)
+
+                runner_result = run_parser_fusion_compare(
+                    config_path,
+                    progress_callback=update_progress,
+                )
+            except Exception as exc:
+                status.update(label="Parser fusion benchmark failed", state="error")
+                st.error(f"Parser fusion benchmark failed: {exc}")
+                return
+
+            status.update(label="Parser fusion benchmark complete", state="complete")
+
+        st.session_state["last_parser_fusion_result"] = runner_result
+        render_parser_fusion_results(runner_result)
+        rendered_current_results = True
+
+    if "last_parser_fusion_result" in st.session_state and not rendered_current_results:
+        with st.expander("Latest Parser Fusion Results", expanded=False):
+            render_parser_fusion_results(dict(st.session_state["last_parser_fusion_result"]))
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(
         "Configure controlled benchmark comparisons and save run_config.yaml files. "
-        "Execution, query expansion, judging, reranking, and answer-model comparison are intentionally excluded here."
+        "Query expansion, judging, reranking, BM25, and answer-model comparison are intentionally excluded."
     )
 
     config, config_error = load_config(CONFIG_PATH)
@@ -2176,12 +2662,13 @@ def main() -> None:
     else:
         st.warning(f"Missing benchmark questions file: {BENCHMARK_QUESTIONS_PATH}")
 
-    parser_tab, chunking_tab, embedding_tab, retrieval_fusion_tab = st.tabs(
+    parser_tab, chunking_tab, embedding_tab, retrieval_fusion_tab, parser_fusion_tab = st.tabs(
         [
             "Parser Compare",
             "Chunking Compare",
             "Embedding Compare",
             "Retrieval Fusion Compare",
+            "Parser Fusion Compare",
         ]
     )
 
@@ -2196,6 +2683,9 @@ def main() -> None:
 
     with retrieval_fusion_tab:
         render_retrieval_fusion_compare_tab(config)
+
+    with parser_fusion_tab:
+        render_parser_fusion_compare_tab(config)
 
 
 if __name__ == "__main__":

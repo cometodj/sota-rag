@@ -1112,6 +1112,242 @@ def generate_fusion_answers(
     return answers
 
 
+def fused_parser_chunk_from_candidate(
+    chunk: dict[str, Any],
+    final_rank: int,
+    fusion_score: float,
+    retrieved_by_parsers: list[str],
+    ranks_by_parser: dict[str, int],
+) -> dict[str, Any]:
+    fused: dict[str, Any] = {
+        "final_rank": final_rank,
+        "rank": final_rank,
+        "chunk_id": str(chunk.get("chunk_id", "")),
+        "document_name": str(chunk.get("document_name", "")),
+        "chunk_index": chunk.get("chunk_index", ""),
+        "text": str(chunk.get("text", "")),
+        "fusion_score": fusion_score,
+        "retrieved_by_parsers": retrieved_by_parsers,
+        "original_ranks_by_parser": ranks_by_parser,
+        "parser_sources": retrieved_by_parsers,
+    }
+    if chunk.get("page_number") not in (None, ""):
+        fused["page_number"] = chunk.get("page_number")
+    if chunk.get("section_title"):
+        fused["section_title"] = chunk.get("section_title")
+    return fused
+
+
+def fuse_parser_chunks(
+    retrieval_by_parser: dict[str, list[dict[str, Any]]],
+    selected_parsers: list[str],
+    fusion_method: str,
+    final_top_k: int,
+    rrf_k: int = 60,
+) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    first_seen: dict[str, tuple[int, int]] = {}
+
+    for parser_index, parser_id in enumerate(selected_parsers):
+        for chunk in retrieval_by_parser.get(parser_id, []):
+            chunk_id = str(chunk.get("chunk_id", ""))
+            if not chunk_id:
+                continue
+            rank = int(chunk.get("rank", 10_000))
+            candidate = candidates.setdefault(
+                chunk_id,
+                {
+                    "chunk": chunk,
+                    "retrieved_by": [],
+                    "ranks_by_parser": {},
+                    "rrf_score": 0.0,
+                },
+            )
+            if parser_id not in candidate["retrieved_by"]:
+                candidate["retrieved_by"].append(parser_id)
+            candidate["ranks_by_parser"][parser_id] = rank
+            candidate["rrf_score"] += 1 / (rrf_k + rank)
+            first_seen.setdefault(chunk_id, (parser_index, rank))
+
+    if fusion_method == "union_dedup":
+        sorted_items = sorted(
+            candidates.items(),
+            key=lambda item: (
+                first_seen[item[0]][0],
+                first_seen[item[0]][1],
+                item[0],
+            ),
+        )
+    elif fusion_method == "rrf":
+        sorted_items = sorted(
+            candidates.items(),
+            key=lambda item: (
+                -float(item[1]["rrf_score"]),
+                min(item[1]["ranks_by_parser"].values()),
+                item[0],
+            ),
+        )
+    else:
+        raise ValueError(f"Unsupported fusion method: {fusion_method}")
+
+    fused_chunks: list[dict[str, Any]] = []
+    for final_rank, (_chunk_id, candidate) in enumerate(sorted_items[:final_top_k], start=1):
+        fusion_score = (
+            float(len(candidate["retrieved_by"]))
+            if fusion_method == "union_dedup"
+            else float(candidate["rrf_score"])
+        )
+        fused_chunks.append(
+            fused_parser_chunk_from_candidate(
+                chunk=candidate["chunk"],
+                final_rank=final_rank,
+                fusion_score=fusion_score,
+                retrieved_by_parsers=list(candidate["retrieved_by"]),
+                ranks_by_parser=dict(candidate["ranks_by_parser"]),
+            )
+        )
+    return fused_chunks
+
+
+def generate_parser_fusion_answers(
+    fused_records: list[dict[str, Any]],
+    answer_model: str,
+) -> list[dict[str, Any]]:
+    answers: list[dict[str, Any]] = []
+    for record in fused_records:
+        answers.append(
+            {
+                "run_id": record["run_id"],
+                "experiment_type": record["experiment_type"],
+                "selected_parsers": record["selected_parsers"],
+                "chunking_strategy": record["chunking_strategy"],
+                "embedding_model": record["embedding_model"],
+                "fusion_method": record["fusion_method"],
+                "answer_model": answer_model,
+                "question_id": record["question_id"],
+                "question": record["question"],
+                "fused_chunks": record["fused_chunks"],
+                "generated_answer": generate_answer(
+                    question=str(record["question"]),
+                    chunks=record["fused_chunks"],
+                    answer_model=answer_model,
+                ),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    return answers
+
+
+def write_parser_fusion_comparison_report(
+    run_dir: Path,
+    selected_parsers: list[str],
+    parser_retrieval_records: dict[str, list[dict[str, Any]]],
+    fused_records: list[dict[str, Any]],
+    answer_records: list[dict[str, Any]],
+) -> tuple[Path, Path]:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = reports_dir / "parser_fusion_comparison.csv"
+    report_path = reports_dir / "parser_fusion_comparison_report.md"
+    answers_by_question = {
+        str(record["question_id"]): record for record in answer_records
+    }
+    retrieval_by_parser = {
+        parser_id: {
+            str(record["question_id"]): record
+            for record in records
+        }
+        for parser_id, records in parser_retrieval_records.items()
+    }
+
+    rows: list[dict[str, Any]] = []
+    for record in fused_records:
+        question_id = str(record["question_id"])
+        fused_chunks = record.get("fused_chunks", [])
+        parser_counts = {
+            parser_id: len(
+                retrieval_by_parser.get(parser_id, {})
+                .get(question_id, {})
+                .get("retrieved_chunks", [])
+            )
+            for parser_id in selected_parsers
+        }
+        answer_record = answers_by_question.get(question_id, {})
+        rows.append(
+            {
+                "question_id": question_id,
+                "question": record["question"],
+                "fusion_method": record["fusion_method"],
+                "parser_retrieved_counts": json.dumps(parser_counts, ensure_ascii=False),
+                "fused_chunk_count": len(fused_chunks),
+                "parser_sources": json.dumps(
+                    {
+                        chunk["chunk_id"]: chunk.get("parser_sources", [])
+                        for chunk in fused_chunks
+                    },
+                    ensure_ascii=False,
+                ),
+                "answer_preview": preview_text(str(answer_record.get("generated_answer", ""))),
+            }
+        )
+
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        fieldnames = [
+            "question_id",
+            "question",
+            "fusion_method",
+            "parser_retrieved_counts",
+            "fused_chunk_count",
+            "parser_sources",
+            "answer_preview",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    lines = [
+        "# Parser Fusion Comparison Benchmark Report",
+        "",
+        "## Summary",
+        "",
+        f"- Questions compared: {len(fused_records)}",
+        f"- Parsers compared: {', '.join(selected_parsers)}",
+        f"- Fusion method: {fused_records[0]['fusion_method'] if fused_records else ''}",
+        "",
+        "This report is neutral and does not automatically claim parser fusion is better.",
+        "",
+        "## Per-Question Results",
+    ]
+    for row in rows:
+        lines.extend(
+            [
+                "",
+                f"### {row['question_id']}",
+                "",
+                f"Question: {row['question']}",
+                "",
+                f"- Parser-only retrieved chunks: `{row['parser_retrieved_counts']}`",
+                f"- Fused chunks: {row['fused_chunk_count']}",
+                f"- Parser sources by fused chunk: `{row['parser_sources']}`",
+                f"- Answer preview: {row['answer_preview']}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Manual Review Notes",
+            "",
+            "- Review whether fused chunks provide more stable or complete context.",
+            "- Compare parser-only retrieved chunks against fused chunks manually.",
+            "- Check whether the generated answer is grounded only in fused chunks.",
+            "- Do not use this report as an automatic parser fusion recommendation.",
+        ]
+    )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, report_path
+
+
 def write_retrieval_fusion_comparison_report(
     run_dir: Path,
     fused_records: list[dict[str, Any]],
@@ -2034,6 +2270,235 @@ def run_retrieval_fusion_compare(
     }
 
 
+def run_parser_fusion_compare(
+    run_config_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    config_path = Path(run_config_path)
+    run_config = read_yaml(config_path)
+    run_dir = config_path.parent
+    pdf_path = Path(run_config.get("uploaded_pdf_path") or run_config["pdf"]["saved_path"])
+    questions_config = run_config.get("benchmark_questions", {})
+    questions_path = Path(
+        run_config.get("benchmark_questions_path")
+        or questions_config.get("saved_path")
+        or questions_config["path"]
+    )
+
+    experiment_type = str(run_config.get("experiment_type", "parser_fusion_compare"))
+    if experiment_type != "parser_fusion_compare":
+        raise ValueError(
+            "run_parser_fusion_compare only supports "
+            f"experiment_type=parser_fusion_compare: {experiment_type}"
+        )
+
+    selected_parsers = [str(parser_id) for parser_id in run_config.get("selected_parsers", [])]
+    unsupported = sorted(set(selected_parsers) - SUPPORTED_PARSERS)
+    if unsupported:
+        raise ValueError(f"Unsupported parser(s) for runner: {unsupported}")
+    if len(selected_parsers) < 2:
+        raise ValueError("Parser Fusion Compare requires at least two selected parsers.")
+
+    chunking_strategy = str(run_config["chunking_strategy"])
+    if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+        raise ValueError(f"Unsupported chunking strategy: {chunking_strategy}")
+
+    fusion_method = str(run_config["fusion_method"])
+    if fusion_method not in {"union_dedup", "rrf"}:
+        raise ValueError(f"Unsupported fusion method: {fusion_method}")
+
+    run_id = str(run_config["run_id"])
+    embedding_model_name = str(run_config["embedding_model"])
+    answer_model = str(run_config["answer_model"])
+    per_parser_top_k = int(run_config["per_parser_top_k"])
+    final_top_k = int(run_config["final_top_k"])
+    rrf_k = int(run_config.get("rrf_k", 60))
+    chunk_size = int(run_config.get("chunk_size", 800))
+    chunk_overlap = int(run_config.get("chunk_overlap", 150))
+    questions = read_benchmark_questions(questions_path)
+    chroma_dir = run_dir / "chroma"
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(chroma_dir))
+    embedding_model = BenchmarkEmbeddingModel(embedding_model_name)
+    parser_retrieval_records: dict[str, list[dict[str, Any]]] = {}
+
+    total_steps = 9
+    step = 0
+
+    def progress(message: str) -> None:
+        nonlocal step
+        step += 1
+        if progress_callback:
+            progress_callback(message, step, total_steps)
+        else:
+            print(f"[{step}/{total_steps}] {message}")
+
+    progress("Preparing run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    progress("Extracting documents")
+    extracted_by_parser: dict[str, list[dict[str, Any]]] = {}
+    extraction_warnings_by_parser: dict[str, list[str]] = {}
+    for parser_id in selected_parsers:
+        parser_dir = run_dir / parser_id
+        extracted, warnings = extract_document(parser_id, pdf_path, parser_dir)
+        extracted_by_parser[parser_id] = extracted
+        extraction_warnings_by_parser[parser_id] = warnings
+
+    progress("Chunking parser outputs")
+    chunks_by_parser: dict[str, list[dict[str, Any]]] = {}
+    warnings_by_parser: dict[str, list[str]] = {}
+    for parser_id in selected_parsers:
+        chunks, warnings = create_chunks_for_strategy(
+            parser_id,
+            extracted_by_parser[parser_id],
+            chunking_strategy,
+            chunk_size,
+            chunk_overlap,
+        )
+        for chunk in chunks:
+            chunk["chunk_id"] = f"{parser_id}:{chunk['chunk_id']}"
+            chunk["parser"] = parser_id
+        warnings_by_parser[parser_id] = extraction_warnings_by_parser[parser_id] + warnings
+        chunks_by_parser[parser_id] = chunks
+        write_jsonl(chunks, run_dir / parser_id / "chunks.jsonl")
+
+    progress("Building parser vector DBs")
+    collections_by_parser: dict[str, Any] = {}
+    collection_names_by_parser: dict[str, str] = {}
+    for parser_id, chunks in chunks_by_parser.items():
+        collection_name = make_strategy_collection_name(
+            run_id=run_id,
+            parser_id=parser_id,
+            chunking_strategy=chunking_strategy,
+            embedding_model_name=embedding_model_name,
+        )
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={
+                "parser": parser_id,
+                "embedding_model": embedding_model_name,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": "parser_fusion",
+                "fusion_method": fusion_method,
+            },
+        )
+        if chunks:
+            index_chunks(chunks, collection, embedding_model, parser_id)
+        collections_by_parser[parser_id] = collection
+        collection_names_by_parser[parser_id] = collection_name
+
+    progress("Running parser retrieval")
+    for parser_id, collection in collections_by_parser.items():
+        if not chunks_by_parser[parser_id]:
+            retrieval_records = empty_retrieval_records(
+                questions,
+                run_id,
+                experiment_type,
+                parser_id,
+                chunking_strategy,
+                embedding_model_name,
+                per_parser_top_k,
+            )
+        else:
+            retrieval_records = retrieve_questions(
+                questions=questions,
+                collection=collection,
+                embedding_model=embedding_model,
+                run_id=run_id,
+                experiment_type=experiment_type,
+                parser_id=parser_id,
+                chunking_strategy=chunking_strategy,
+                embedding_model_name=embedding_model_name,
+                top_k=per_parser_top_k,
+            )
+        write_jsonl(retrieval_records, run_dir / parser_id / "retrieval_results.jsonl")
+        parser_retrieval_records[parser_id] = retrieval_records
+
+    progress("Fusing parser retrieval results")
+    retrieval_by_question_and_parser: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for parser_id, records in parser_retrieval_records.items():
+        for record in records:
+            question_id = str(record["question_id"])
+            retrieval_by_question_and_parser.setdefault(question_id, {})[parser_id] = record.get(
+                "retrieved_chunks",
+                [],
+            )
+
+    fused_records: list[dict[str, Any]] = []
+    for question in questions:
+        fused_chunks = fuse_parser_chunks(
+            retrieval_by_parser=retrieval_by_question_and_parser.get(question["id"], {}),
+            selected_parsers=selected_parsers,
+            fusion_method=fusion_method,
+            final_top_k=final_top_k,
+            rrf_k=rrf_k,
+        )
+        fused_records.append(
+            {
+                "run_id": run_id,
+                "experiment_type": experiment_type,
+                "selected_parsers": selected_parsers,
+                "chunking_strategy": chunking_strategy,
+                "embedding_model": embedding_model_name,
+                "fusion_method": fusion_method,
+                "question_id": question["id"],
+                "question": question["question"],
+                "per_parser_top_k": per_parser_top_k,
+                "final_top_k": final_top_k,
+                "fused_chunks": fused_chunks,
+            }
+        )
+
+    fusion_dir = run_dir / "parser_fusion"
+    fusion_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(fused_records, fusion_dir / "fused_retrieval_results.jsonl")
+
+    progress("Generating answers")
+    answer_records = generate_parser_fusion_answers(fused_records, answer_model)
+    write_jsonl(answer_records, fusion_dir / "answer_results.jsonl")
+
+    progress("Saving comparison report")
+    csv_path, report_path = write_parser_fusion_comparison_report(
+        run_dir,
+        selected_parsers,
+        parser_retrieval_records,
+        fused_records,
+        answer_records,
+    )
+
+    return {
+        "run_id": run_id,
+        "experiment_type": experiment_type,
+        "run_dir": str(run_dir),
+        "chroma_dir": str(chroma_dir),
+        "selected_parsers": selected_parsers,
+        "chunking_strategy": chunking_strategy,
+        "embedding_model": embedding_model_name,
+        "fusion_method": fusion_method,
+        "parser_warnings": warnings_by_parser,
+        "reports": {
+            "parser_fusion_comparison_csv": str(csv_path),
+            "parser_fusion_comparison_report": str(report_path),
+        },
+        "parser_results": {
+            parser_id: {
+                "collection_name": collection_names_by_parser[parser_id],
+                "chunk_count": len(chunks_by_parser[parser_id]),
+                "warnings": warnings_by_parser[parser_id],
+                "retrieval_results": str(run_dir / parser_id / "retrieval_results.jsonl"),
+            }
+            for parser_id in selected_parsers
+        },
+        "fusion_results": {
+            "fused_retrieval_results": str(fusion_dir / "fused_retrieval_results.jsonl"),
+            "answer_results": str(fusion_dir / "answer_results.jsonl"),
+        },
+    }
+
+
 def run_benchmark_from_config(
     run_config_path: str | Path,
     progress_callback: ProgressCallback | None = None,
@@ -2048,6 +2513,8 @@ def run_benchmark_from_config(
         return run_embedding_compare(run_config_path, progress_callback=progress_callback)
     if experiment_type == "retrieval_fusion_compare":
         return run_retrieval_fusion_compare(run_config_path, progress_callback=progress_callback)
+    if experiment_type == "parser_fusion_compare":
+        return run_parser_fusion_compare(run_config_path, progress_callback=progress_callback)
     raise ValueError(f"Unsupported experiment_type for benchmark runner: {experiment_type}")
 
 
