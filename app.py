@@ -65,6 +65,13 @@ PARSER_ID_BY_LABEL = {
     "Docling": "docling",
 }
 CHUNKING_STRATEGY_OPTIONS = ["fixed-size", "page-based", "section-aware"]
+TABLE_AWARE_CHUNKING_STRATEGY_OPTIONS = [
+    "fixed-size",
+    "page-based",
+    "section-aware",
+    "table-aware",
+    "parent-child table context",
+]
 DEFAULT_RETRIEVAL_STRATEGY = "dense_vector"
 
 
@@ -94,6 +101,70 @@ def unique_preserve_order(values: list[str]) -> list[str]:
             unique_values.append(value)
             seen.add(value)
     return unique_values
+
+
+def get_default_table_handling_config() -> dict[str, bool]:
+    return {
+        "detect_tables": True,
+        "preserve_table_markdown": True,
+        "include_full_table_context": True,
+        "include_nearby_context": True,
+        "include_table_json": False,
+        "use_parent_child_table_context": False,
+    }
+
+
+def render_table_handling_options(
+    key_prefix: str,
+    title: str = "Table Handling Options",
+    show_detection_options: bool = True,
+    include_answer_context_options: bool = True,
+    full_context_label: str = "Include full table markdown when retrieved",
+) -> dict[str, bool]:
+    defaults = get_default_table_handling_config()
+    st.markdown(f"#### {title}")
+    detect_tables = defaults["detect_tables"]
+    preserve_table_markdown = defaults["preserve_table_markdown"]
+    if show_detection_options:
+        detect_tables = st.checkbox(
+            "Detect table-like chunks",
+            value=defaults["detect_tables"],
+            key=f"{key_prefix}_detect_tables",
+        )
+        preserve_table_markdown = st.checkbox(
+            "Preserve Markdown tables if available",
+            value=defaults["preserve_table_markdown"],
+            key=f"{key_prefix}_preserve_table_markdown",
+        )
+
+    include_full_table_context = defaults["include_full_table_context"]
+    include_nearby_context = defaults["include_nearby_context"]
+    include_table_json = defaults["include_table_json"]
+    if include_answer_context_options:
+        include_full_table_context = st.checkbox(
+            full_context_label,
+            value=defaults["include_full_table_context"],
+            key=f"{key_prefix}_include_full_table_context",
+        )
+        include_nearby_context = st.checkbox(
+            "Include nearby section context",
+            value=defaults["include_nearby_context"],
+            key=f"{key_prefix}_include_nearby_context",
+        )
+        include_table_json = st.checkbox(
+            "Include raw table JSON if available",
+            value=defaults["include_table_json"],
+            key=f"{key_prefix}_include_table_json",
+        )
+
+    return {
+        "detect_tables": bool(detect_tables),
+        "preserve_table_markdown": bool(preserve_table_markdown),
+        "include_full_table_context": bool(include_full_table_context),
+        "include_nearby_context": bool(include_nearby_context),
+        "include_table_json": bool(include_table_json),
+        "use_parent_child_table_context": defaults["use_parent_child_table_context"],
+    }
 
 
 def is_ollama_embedding_model(model_name: str) -> bool:
@@ -791,14 +862,18 @@ def chunk_rows(chunks: list[dict[str, Any]], highlight_ids: set[str] | None = No
     rows: list[dict[str, Any]] = []
     for chunk in chunks:
         chunk_id = str(chunk.get("chunk_id", ""))
-        score_or_distance = chunk.get("score", chunk.get("distance"))
+        score_or_distance = chunk.get("score", chunk.get("distance", chunk.get("fusion_score")))
+        table_label = table_chunk_label(chunk)
         rows.append(
             {
-                "rank": chunk.get("rank", ""),
+                "rank": chunk.get("rank", chunk.get("final_rank", "")),
+                "chunk_type": table_label,
                 "chunk_id": chunk_id,
                 "document_name": chunk.get("document_name", ""),
                 "page_number": chunk.get("page_number", ""),
                 "section_title": chunk.get("section_title", ""),
+                "caption": chunk.get("caption", chunk.get("table_caption", "")),
+                "parser_source": chunk.get("parser", chunk.get("source", "")),
                 "chunk_index": chunk.get("chunk_index", ""),
                 "score_or_distance": score_or_distance,
                 "expanded_only": chunk_id in highlight_ids,
@@ -806,6 +881,93 @@ def chunk_rows(chunks: list[dict[str, Any]], highlight_ids: set[str] | None = No
             }
         )
     return pd.DataFrame(rows)
+
+
+def is_possible_table_chunk(text: Any) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    table_lines = [line for line in lines if line.startswith("|") and line.endswith("|")]
+    if len(table_lines) >= 2:
+        return True
+    return any(re.search(r"\|\s*:?-{3,}:?\s*\|", line) for line in lines)
+
+
+def table_chunk_label(chunk: dict[str, Any]) -> str:
+    chunk_type = str(chunk.get("chunk_type") or chunk.get("content_type") or "").casefold()
+    if chunk_type == "table":
+        return "[Table Chunk]"
+    if chunk.get("contains_table") is True or is_possible_table_chunk(chunk.get("text", "")):
+        return "[Possible Table Chunk]"
+    return "[Text Chunk]"
+
+
+def count_table_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    table_chunks = 0
+    possible_table_chunks = 0
+    text_chunks = 0
+    table_pages: set[str] = set()
+
+    for chunk in chunks:
+        label = table_chunk_label(chunk)
+        if label == "[Table Chunk]":
+            table_chunks += 1
+        elif label == "[Possible Table Chunk]":
+            possible_table_chunks += 1
+        else:
+            text_chunks += 1
+
+        if label != "[Text Chunk]" and chunk.get("page_number") not in (None, ""):
+            table_pages.add(str(chunk.get("page_number")))
+
+    return {
+        "total_retrieved_chunks": len(chunks),
+        "table_chunks": table_chunks,
+        "possible_table_chunks": possible_table_chunks,
+        "text_chunks": text_chunks,
+        "pages_containing_table_evidence": ", ".join(sorted(table_pages, key=lambda value: safe_int(value, 0))) or "N/A",
+    }
+
+
+def table_markdown_for_chunk(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("table_markdown") or chunk.get("markdown_table") or chunk.get("text") or "")
+
+
+def render_table_chunk_details(chunks: list[dict[str, Any]]) -> None:
+    table_like_chunks = [
+        chunk for chunk in chunks if table_chunk_label(chunk) in {"[Table Chunk]", "[Possible Table Chunk]"}
+    ]
+    if not table_like_chunks:
+        return
+
+    st.markdown("##### Table Chunk Details")
+    for index, chunk in enumerate(table_like_chunks, start=1):
+        label = table_chunk_label(chunk)
+        chunk_id = str(chunk.get("chunk_id", f"chunk-{index}"))
+        caption = chunk.get("caption") or chunk.get("table_caption") or "No caption"
+        with st.expander(f"{label} {chunk_id} - {caption}", expanded=False):
+            st.write(
+                {
+                    "chunk_id": chunk_id,
+                    "page_number": chunk.get("page_number", "N/A"),
+                    "section_title": chunk.get("section_title", "N/A"),
+                    "caption": caption,
+                    "parser_source": chunk.get("parser", chunk.get("source", "N/A")),
+                    "rank": chunk.get("rank", chunk.get("final_rank", "N/A")),
+                    "score_distance_or_fusion": chunk.get(
+                        "score",
+                        chunk.get("distance", chunk.get("fusion_score", "N/A")),
+                    ),
+                }
+            )
+            with st.expander("Show full table markdown", expanded=False):
+                st.markdown(table_markdown_for_chunk(chunk))
+            with st.expander("Show nearby context", expanded=False):
+                nearby_context = chunk.get("nearby_context") or chunk.get("parent_context")
+                if nearby_context:
+                    st.markdown(str(nearby_context))
+                else:
+                    st.info("No nearby_context field is available for this chunk.")
+            with st.expander("Show raw chunk JSON", expanded=False):
+                st.json(chunk)
 
 
 def unique_chunks(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -827,6 +989,7 @@ def render_chunk_table(
         st.info(empty_message)
         return
 
+    st.write(count_table_chunks(chunks))
     st.dataframe(
         chunk_rows(chunks, highlight_ids=highlight_ids),
         hide_index=True,
@@ -839,6 +1002,7 @@ def render_chunk_table(
             ),
         },
     )
+    render_table_chunk_details(chunks)
 
 
 def render_file_warnings(errors: list[str]) -> None:
@@ -1304,6 +1468,7 @@ def setup_run_config(experiment_type: str, top_k: int) -> dict[str, Any]:
         "experiment_type": experiment_type,
         "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
         "top_k": int(top_k),
+        "table_handling": get_default_table_handling_config(),
         "uploaded_pdf_path": None,
         "benchmark_questions_path": str(BENCHMARK_QUESTIONS_PATH),
         "notes": "Configured from Streamlit Benchmark Tool. Execution is not started by this cleanup UI flow.",
@@ -1591,14 +1756,7 @@ def render_parser_fusion_chunk_table(
 ) -> None:
     st.markdown(f"#### {title}")
     chunks = record_chunks(record, fused=fused)
-    if not chunks:
-        st.info("No chunks found for this question.")
-        return
-    st.dataframe(
-        parser_fusion_chunk_rows(chunks, fused=fused),
-        hide_index=True,
-        use_container_width=True,
-    )
+    render_chunk_table(chunks, "No chunks found for this question.")
 
 
 def render_raw_json_expander(title: str, record: dict[str, Any] | None) -> None:
@@ -1943,6 +2101,7 @@ def profile_defaults(run_id: str, run_config: dict[str, Any]) -> dict[str, Any]:
         "per_parser_top_k": run_config.get("per_parser_top_k", ""),
         "final_top_k": run_config.get("final_top_k", ""),
         "answer_model": run_config.get("answer_model", ""),
+        "table_handling": run_config.get("table_handling", get_default_table_handling_config()),
         "notes": "",
     }
 
@@ -1961,6 +2120,7 @@ def render_run_config_summary(run_config: dict[str, Any]) -> None:
         "selected_embedding_models",
         "retrieval_strategy",
         "fusion_method",
+        "table_handling",
         "answer_model",
         "top_k",
         "per_model_top_k",
@@ -2032,6 +2192,9 @@ def render_best_profile_form(run_id: str, run_config: dict[str, Any]) -> None:
     )
     answer_options = [value for value in answer_options if value]
     parser_options = unique_preserve_order(["pymupdf", "docling"] + selected_parsers_from_config)
+    table_handling = defaults.get("table_handling", get_default_table_handling_config())
+    if not isinstance(table_handling, dict):
+        table_handling = get_default_table_handling_config()
 
     st.markdown("### Manual Best Profile Selection")
     with st.form(f"best_profile_form_{run_id}"):
@@ -2113,6 +2276,8 @@ def render_best_profile_form(run_id: str, run_config: dict[str, Any]) -> None:
             options=answer_options or ANSWER_MODEL_OPTIONS,
             index=default_index(answer_options or ANSWER_MODEL_OPTIONS, str(defaults["answer_model"])),
         )
+        st.markdown("#### table_handling")
+        st.json(table_handling)
         notes = st.text_area("notes", value=str(defaults["notes"]))
         submitted = st.form_submit_button("Save Best Profile", type="primary")
 
@@ -2135,6 +2300,7 @@ def render_best_profile_form(run_id: str, run_config: dict[str, Any]) -> None:
                 "per_parser_top_k": int(per_parser_top_k),
                 "final_top_k": int(final_top_k),
                 "answer_model": answer_model,
+                "table_handling": table_handling,
             },
             "selected_by": "manual",
             "selected_at": datetime.now(timezone.utc).isoformat(),
@@ -2552,33 +2718,7 @@ def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
 
     st.markdown("#### Fused Chunks")
     fused_chunks = fused_record.get("fused_chunks", [])
-    if not fused_chunks:
-        st.info("No fused chunks found for this question.")
-        return
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "final_rank": chunk.get("final_rank"),
-                    "chunk_id": chunk.get("chunk_id"),
-                    "page_number": chunk.get("page_number", ""),
-                    "section_title": chunk.get("section_title", ""),
-                    "fusion_score": chunk.get("fusion_score"),
-                    "retrieved_by_embedding_models": ", ".join(
-                        chunk.get("retrieved_by_embedding_models", [])
-                    ),
-                    "original_ranks_by_model": json.dumps(
-                        chunk.get("original_ranks_by_model", {}),
-                        ensure_ascii=False,
-                    ),
-                    "text_preview": preview_text(chunk.get("text", "")),
-                }
-                for chunk in fused_chunks
-            ]
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
+    render_chunk_table(fused_chunks, "No fused chunks found for this question.")
 
 
 def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
@@ -2640,32 +2780,7 @@ def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
 
     st.markdown("#### Fused Chunks")
     fused_chunks = fused_record.get("fused_chunks", [])
-    if not fused_chunks:
-        st.info("No fused chunks found for this question.")
-        return
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "final_rank": chunk.get("final_rank"),
-                    "chunk_id": chunk.get("chunk_id"),
-                    "page_number": chunk.get("page_number", ""),
-                    "section_title": chunk.get("section_title", ""),
-                    "fusion_score": chunk.get("fusion_score"),
-                    "retrieved_by_parsers": ", ".join(chunk.get("retrieved_by_parsers", [])),
-                    "original_ranks_by_parser": json.dumps(
-                        chunk.get("original_ranks_by_parser", {}),
-                        ensure_ascii=False,
-                    ),
-                    "parser_sources": ", ".join(chunk.get("parser_sources", [])),
-                    "text_preview": preview_text(chunk.get("text", "")),
-                }
-                for chunk in fused_chunks
-            ]
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
+    render_chunk_table(fused_chunks, "No fused chunks found for this question.")
 
 
 def render_parser_compare_tab(config: dict[str, Any]) -> None:
@@ -2688,6 +2803,12 @@ def render_parser_compare_tab(config: dict[str, Any]) -> None:
         "Chunking strategy",
         options=CHUNKING_STRATEGY_OPTIONS,
         key="parser_compare_chunking",
+    )
+    table_handling = render_table_handling_options(
+        "parser_compare_table",
+        title="Table Handling Options",
+        include_answer_context_options=True,
+        full_context_label="Include full table context in answer generation",
     )
     embedding_model = st.selectbox(
         "Embedding model",
@@ -2733,6 +2854,7 @@ def render_parser_compare_tab(config: dict[str, Any]) -> None:
                 "selected_parsers": selected_parsers,
                 "chunking_strategy": chunking_strategy,
                 "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
+                "table_handling": table_handling,
                 "embedding_model": embedding_model,
                 "answer_model": answer_model,
                 "chunk_size": safe_int(
@@ -2766,10 +2888,17 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
     parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="chunking_compare_parser")
     selected_chunking_strategies = selected_options_from_checkboxes(
         "Chunking strategies",
-        CHUNKING_STRATEGY_OPTIONS,
+        TABLE_AWARE_CHUNKING_STRATEGY_OPTIONS,
         ["fixed-size", "page-based"],
         "chunking_compare_strategy",
     )
+    table_handling = get_default_table_handling_config()
+    if "parent-child table context" in selected_chunking_strategies:
+        table_handling["use_parent_child_table_context"] = True
+    if "table-aware" in selected_chunking_strategies:
+        table_handling["detect_tables"] = True
+        table_handling["preserve_table_markdown"] = True
+        table_handling["include_full_table_context"] = True
     embedding_model = st.selectbox(
         "Embedding model",
         options=embedding_options,
@@ -2814,6 +2943,7 @@ def render_chunking_compare_tab(config: dict[str, Any]) -> None:
                 "parser": PARSER_ID_BY_LABEL[parser_label],
                 "selected_chunking_strategies": selected_chunking_strategies,
                 "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
+                "table_handling": table_handling,
                 "embedding_model": embedding_model,
                 "answer_model": answer_model,
                 "chunk_size": safe_int(
@@ -2946,6 +3076,12 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
         options=["union_dedup", "rrf"],
         key="retrieval_fusion_method",
     )
+    table_handling = render_table_handling_options(
+        "retrieval_fusion_table",
+        title="Answer Context Options",
+        show_detection_options=False,
+        include_answer_context_options=True,
+    )
     answer_model = st.selectbox(
         "Answer model",
         options=answer_options,
@@ -2999,6 +3135,7 @@ def render_retrieval_fusion_compare_tab(config: dict[str, Any]) -> None:
                 "retrieval_strategy": "fusion",
                 "selected_embedding_models": selected_embedding_models,
                 "fusion_method": fusion_method,
+                "table_handling": table_handling,
                 "answer_model": answer_model,
                 "per_model_top_k": int(per_model_top_k),
                 "final_top_k": int(final_top_k),
@@ -3049,6 +3186,12 @@ def render_parser_fusion_compare_tab(config: dict[str, Any]) -> None:
         "Fusion method",
         options=["union_dedup", "rrf"],
         key="parser_fusion_method",
+    )
+    table_handling = render_table_handling_options(
+        "parser_fusion_table",
+        title="Answer Context Options",
+        show_detection_options=False,
+        include_answer_context_options=True,
     )
     answer_model = st.selectbox(
         "Answer model",
@@ -3104,6 +3247,7 @@ def render_parser_fusion_compare_tab(config: dict[str, Any]) -> None:
                 "retrieval_strategy": "parser_fusion",
                 "embedding_model": embedding_model,
                 "fusion_method": fusion_method,
+                "table_handling": table_handling,
                 "answer_model": answer_model,
                 "per_parser_top_k": int(per_parser_top_k),
                 "final_top_k": int(final_top_k),
