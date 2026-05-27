@@ -2020,6 +2020,16 @@ def render_table_evidence_used(answer_record: dict[str, Any] | None) -> None:
                 st.json(record)
 
 
+def render_answer_intent(answer_record: dict[str, Any] | None) -> None:
+    if not answer_record:
+        return
+    intent = str(answer_record.get("answer_intent") or "").strip().lower()
+    if intent == "comparison":
+        st.caption("Comparison Answer")
+    elif intent:
+        st.caption(f"Answer intent: `{intent}`")
+
+
 def render_expanded_context_chunks(answer_record: dict[str, Any] | None) -> None:
     records = []
     if answer_record and isinstance(answer_record.get("expanded_context_chunks"), list):
@@ -2246,6 +2256,7 @@ def render_parser_fusion_existing_results_browser() -> None:
         st.info("No answer record found for this question.")
     else:
         st.caption(f"Answer model: `{answer_record.get('answer_model', 'N/A')}`")
+        render_answer_intent(answer_record)
         st.markdown(str(answer_record.get("generated_answer") or "N/A"))
         render_table_evidence_used(answer_record)
         render_expanded_context_chunks(answer_record)
@@ -2527,6 +2538,7 @@ def render_answer_case(case_record: dict[str, Any]) -> None:
     st.markdown("##### Answer Preview")
     st.write(make_answer_preview(case_record.get("generated_answer", "")))
     with st.expander("Full generated answer", expanded=False):
+        render_answer_intent(case_record)
         st.markdown(str(case_record.get("generated_answer") or "N/A"))
     render_table_evidence_used(case_record)
     render_expanded_context_chunks(case_record)
@@ -2851,6 +2863,7 @@ def render_parser_compare_results(runner_result: dict[str, Any]) -> None:
                 continue
 
             st.markdown("##### Generated Answer")
+            render_answer_intent(record)
             st.markdown(str(record.get("generated_answer", "")))
             render_table_evidence_used(record)
             render_expanded_context_chunks(record)
@@ -2944,6 +2957,7 @@ def render_chunking_compare_results(runner_result: dict[str, Any]) -> None:
                 continue
 
             st.markdown("##### Generated Answer")
+            render_answer_intent(record)
             st.markdown(str(record.get("generated_answer", "")))
             render_table_evidence_used(record)
             render_expanded_context_chunks(record)
@@ -3038,6 +3052,7 @@ def render_embedding_compare_results(runner_result: dict[str, Any]) -> None:
                 continue
 
             st.markdown("##### Generated Answer")
+            render_answer_intent(record)
             st.markdown(str(record.get("generated_answer", "")))
             render_table_evidence_used(record)
             render_expanded_context_chunks(record)
@@ -3103,6 +3118,7 @@ def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
     answer_record = answers_by_question.get(selected_question_id, {})
 
     st.markdown("#### Generated Answer")
+    render_answer_intent(answer_record)
     st.markdown(str(answer_record.get("generated_answer", "")))
     render_table_evidence_used(answer_record)
     render_expanded_context_chunks(answer_record)
@@ -3167,6 +3183,7 @@ def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
     answer_record = answers_by_question.get(selected_question_id, {})
 
     st.markdown("#### Generated Answer")
+    render_answer_intent(answer_record)
     st.markdown(str(answer_record.get("generated_answer", "")))
     render_table_evidence_used(answer_record)
     render_expanded_context_chunks(answer_record)

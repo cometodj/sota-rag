@@ -758,6 +758,32 @@ def table_evidence_used(
     return evidence
 
 
+COMPARE_KEYWORDS = [
+    "compare",
+    "comparison",
+    "difference",
+    "differences",
+    "versus",
+    "contrast",
+    "비교",
+    "차이",
+    "다른 점",
+    "공통점",
+    "대비",
+]
+
+
+def is_compare_question(question: str) -> bool:
+    normalized = str(question or "").casefold()
+    if re.search(r"\bvs\.?\b", normalized):
+        return True
+    return any(keyword in normalized for keyword in COMPARE_KEYWORDS)
+
+
+def answer_intent(question: str) -> str:
+    return "comparison" if is_compare_question(question) else "normal"
+
+
 def build_answer_prompt(
     question: str,
     chunks: list[dict[str, Any]],
@@ -765,6 +791,45 @@ def build_answer_prompt(
     all_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
     context = build_answer_context(chunks, table_handling, all_chunks=all_chunks)
+    if is_compare_question(question):
+        return f"""You answer technical-document comparison questions using only retrieved and expanded context.
+
+Rules:
+- Use only the retrieved and expanded context below.
+- Do not use outside knowledge.
+- Do not invent unsupported differences or similarities.
+- If one side lacks evidence, clearly say the evidence is missing.
+- Preserve exact technical terms, field names, bit values, and table values.
+- Pay special attention to table evidence.
+- Some table evidence may be split across multiple chunks.
+- If table fragments are grouped by table_id or parent_table_id, treat them as one table.
+- If comparing table values, include all relevant values found in context.
+- If the context contains a value table, list all relevant value-description pairs.
+- Preserve exact value codes such as 000b, 001b, and 010b.
+- Do not stop after the first table row.
+- If a table lists values, preserve the value-to-description relationship.
+- Do not invent table values.
+- Do not infer values that are not in the table.
+- If only partial table evidence is available, state: "The retrieved table evidence appears incomplete."
+- In Evidence Used, cite chunk_id, page number, section title, and parser/source when available.
+
+Question:
+{question}
+
+Retrieved and expanded context:
+{context}
+
+Return exactly these sections:
+## Comparison Summary
+## Side-by-side Comparison Table
+| Aspect | Item A | Item B | Evidence |
+|---|---|---|---|
+## Key Differences
+## Similarities
+## Evidence Used
+## Missing or Uncertain Information
+"""
+
     return f"""You answer technical-document questions using only retrieved and expanded context.
 
 Rules:
@@ -808,6 +873,23 @@ def generate_answer(
     all_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
     if not chunks:
+        if is_compare_question(question):
+            return (
+                "## Comparison Summary\n"
+                "The retrieved context is insufficient because no chunks were retrieved.\n\n"
+                "## Side-by-side Comparison Table\n"
+                "| Aspect | Item A | Item B | Evidence |\n"
+                "|---|---|---|---|\n"
+                "| Retrieved evidence | Missing | Missing | No retrieved chunks were available. |\n\n"
+                "## Key Differences\n"
+                "- Cannot determine differences from the retrieved context.\n\n"
+                "## Similarities\n"
+                "- Cannot determine similarities from the retrieved context.\n\n"
+                "## Evidence Used\n"
+                "- None\n\n"
+                "## Missing or Uncertain Information\n"
+                "- No retrieved chunks were available.\n"
+            )
         return (
             "## Answer Summary\n"
             "The retrieved context is insufficient because no chunks were retrieved.\n\n"
@@ -838,6 +920,7 @@ def generate_answers(
     answers: list[dict[str, Any]] = []
     for record in retrieval_records:
         chunks = record["retrieved_chunks"]
+        intent = answer_intent(str(record["question"]))
         _context_chunks, expansion_records = prepare_answer_context_chunks(
             chunks,
             table_handling,
@@ -851,6 +934,7 @@ def generate_answers(
                 "chunking_strategy": record["chunking_strategy"],
                 "embedding_model": record["embedding_model"],
                 "answer_model": answer_model,
+                "answer_intent": intent,
                 "question_id": record["question_id"],
                 "question": record["question"],
                 "retrieved_chunks": chunks,
@@ -1642,6 +1726,7 @@ def generate_fusion_answers(
     answers: list[dict[str, Any]] = []
     for record in fused_records:
         chunks = record["fused_chunks"]
+        intent = answer_intent(str(record["question"]))
         _context_chunks, expansion_records = prepare_answer_context_chunks(
             chunks,
             table_handling,
@@ -1656,6 +1741,7 @@ def generate_fusion_answers(
                 "selected_embedding_models": record["selected_embedding_models"],
                 "fusion_method": record["fusion_method"],
                 "answer_model": answer_model,
+                "answer_intent": intent,
                 "question_id": record["question_id"],
                 "question": record["question"],
                 "fused_chunks": chunks,
@@ -1788,6 +1874,7 @@ def generate_parser_fusion_answers(
     answers: list[dict[str, Any]] = []
     for record in fused_records:
         chunks = record["fused_chunks"]
+        intent = answer_intent(str(record["question"]))
         _context_chunks, expansion_records = prepare_answer_context_chunks(
             chunks,
             table_handling,
@@ -1802,6 +1889,7 @@ def generate_parser_fusion_answers(
                 "embedding_model": record["embedding_model"],
                 "fusion_method": record["fusion_method"],
                 "answer_model": answer_model,
+                "answer_intent": intent,
                 "question_id": record["question_id"],
                 "question": record["question"],
                 "fused_chunks": chunks,
