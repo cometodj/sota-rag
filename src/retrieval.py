@@ -15,7 +15,13 @@ DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
 TABLE_METADATA_KEYS = [
     "chunk_type",
     "table_id",
+    "parent_table_id",
+    "table_group_index",
+    "table_fragment_index",
     "table_markdown",
+    "full_table_markdown",
+    "parent_table_text",
+    "table_value_codes",
     "nearby_context",
     "caption",
     "source_parser",

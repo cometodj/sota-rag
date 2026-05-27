@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from table_aware import add_table_metadata, extract_markdown_table_blocks
+from table_aware import add_table_metadata, assign_table_group_ids, extract_markdown_table_blocks
 
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
@@ -76,7 +76,7 @@ def split_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
             break
         start = end - chunk_overlap
 
-    return chunks
+    return assign_table_group_ids(chunks)
 
 
 def create_chunks(
@@ -93,28 +93,44 @@ def create_chunks(
         text = str(record.get("text", ""))
         chunk_start_index = per_document_chunk_counts.get(document_name, 0)
         table_blocks = extract_markdown_table_blocks(text)
-        table_ranges = {
-            (int(block["start_line"]), int(block["end_line"]))
-            for block in table_blocks
-        }
         lines = text.splitlines()
 
-        text_segments: list[str] = []
+        text_segments: list[dict[str, Any]] = []
         cursor = 0
-        for start, end in sorted(table_ranges):
+        sorted_table_blocks = sorted(
+            table_blocks,
+            key=lambda block: int(block["start_line"]),
+        )
+        for table_offset, table_block in enumerate(sorted_table_blocks):
+            start = int(table_block["start_line"])
+            end = int(table_block["end_line"])
             segment = "\n".join(lines[cursor:start]).strip()
             if segment:
-                text_segments.append(segment)
+                text_segments.append(
+                    {
+                        "text": segment,
+                        "parent_table_id": (
+                            f"{document_name}:docling:r{record_index:04d}:t{table_offset:04d}"
+                        ),
+                    }
+                )
             cursor = end + 1
         trailing_segment = "\n".join(lines[cursor:]).strip()
         if trailing_segment:
-            text_segments.append(trailing_segment)
+            parent_table_id = None
+            if sorted_table_blocks:
+                parent_table_id = (
+                    f"{document_name}:docling:r{record_index:04d}:"
+                    f"t{len(sorted_table_blocks) - 1:04d}"
+                )
+            text_segments.append({"text": trailing_segment, "parent_table_id": parent_table_id})
 
         if not table_blocks:
-            text_segments = [text]
+            text_segments = [{"text": text, "parent_table_id": None}]
 
         offset = 0
-        for segment in text_segments:
+        for segment_record in text_segments:
+            segment = str(segment_record["text"])
             for chunk_text in split_text(segment, chunk_size, chunk_overlap):
                 chunk_index = chunk_start_index + offset
                 chunk = {
@@ -126,11 +142,15 @@ def create_chunks(
                     "char_count": len(chunk_text),
                     "source": "docling",
                 }
-                add_table_metadata(chunk, source_parser="docling")
+                add_table_metadata(
+                    chunk,
+                    source_parser="docling",
+                    parent_table_id=segment_record.get("parent_table_id"),
+                )
                 chunks.append(chunk)
                 offset += 1
 
-        for table_offset, table_block in enumerate(table_blocks):
+        for table_offset, table_block in enumerate(sorted_table_blocks):
             table_markdown = str(table_block["table_markdown"])
             nearby_context = str(table_block.get("nearby_context") or "")
             caption = table_block.get("caption")
@@ -158,6 +178,7 @@ def create_chunks(
                 chunk,
                 source_parser="docling",
                 table_id=f"{document_name}:docling:r{record_index:04d}:t{table_offset:04d}",
+                parent_table_id=f"{document_name}:docling:r{record_index:04d}:t{table_offset:04d}",
                 table_markdown=table_markdown,
                 nearby_context=nearby_context,
                 caption=str(caption) if caption else None,

@@ -13,7 +13,12 @@ from typing import Any
 
 import yaml
 
-from table_aware import add_table_metadata, classify_chunk_text, is_possible_table_text
+from table_aware import (
+    add_table_metadata,
+    assign_table_group_ids,
+    classify_chunk_text,
+    is_possible_table_text,
+)
 
 
 BATCH_SIZE = 128
@@ -29,7 +34,13 @@ ProgressCallback = Callable[[str, int, int], None]
 TABLE_METADATA_KEYS = [
     "chunk_type",
     "table_id",
+    "parent_table_id",
+    "table_group_index",
+    "table_fragment_index",
     "table_markdown",
+    "full_table_markdown",
+    "parent_table_text",
+    "table_value_codes",
     "nearby_context",
     "caption",
     "source_parser",
@@ -209,6 +220,80 @@ def chunk_metadata(chunk: dict[str, Any], parser_id: str) -> dict[str, str | int
     return metadata
 
 
+def chunk_group_key(chunk: dict[str, Any]) -> str:
+    if not isinstance(chunk, dict):
+        return f"object:{id(chunk)}"
+    chunk_id = chunk.get("chunk_id")
+    if chunk_id not in (None, ""):
+        return f"chunk:{chunk_id}"
+    return f"object:{id(chunk)}"
+
+
+def table_group_id(chunk: dict[str, Any]) -> str:
+    if not isinstance(chunk, dict):
+        return ""
+    return str(chunk.get("parent_table_id") or chunk.get("table_id") or "")
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def adjacent_context_chunks(
+    target: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    window: int = 1,
+) -> list[dict[str, Any]]:
+    if not isinstance(target, dict):
+        return []
+    target_index = int_or_none(target.get("chunk_index"))
+    if target_index is None:
+        return []
+
+    target_document = str(target.get("document_name") or "")
+    target_source = str(
+        target.get("source_parser")
+        or target.get("parser")
+        or target.get("source")
+        or ""
+    )
+    target_page = target.get("page_number")
+
+    adjacent: list[dict[str, Any]] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if chunk is target:
+            continue
+        if table_group_id(chunk):
+            continue
+        chunk_index = int_or_none(chunk.get("chunk_index"))
+        if chunk_index is None or abs(chunk_index - target_index) > window:
+            continue
+        if target_document and str(chunk.get("document_name") or "") != target_document:
+            continue
+
+        chunk_source = str(
+            chunk.get("source_parser")
+            or chunk.get("parser")
+            or chunk.get("source")
+            or ""
+        )
+        if target_source and chunk_source and chunk_source != target_source:
+            continue
+        if target_page not in (None, "") and chunk.get("page_number") not in (None, ""):
+            if str(chunk.get("page_number")) != str(target_page):
+                continue
+        adjacent.append(chunk)
+
+    return sorted(adjacent, key=lambda item: int_or_none(item.get("chunk_index")) or 0)
+
+
 def index_chunks(
     chunks: list[dict[str, Any]],
     collection: Any,
@@ -318,6 +403,8 @@ def empty_retrieval_records(
 
 
 def evidence_label(chunk: dict[str, Any]) -> str:
+    if not isinstance(chunk, dict):
+        return "invalid_chunk"
     parts = [
         f"chunk_id={chunk.get('chunk_id', '')}",
         f"rank={chunk.get('rank', '')}",
@@ -334,6 +421,8 @@ def evidence_label(chunk: dict[str, Any]) -> str:
 
 
 def source_parser_for_chunk(chunk: dict[str, Any]) -> str:
+    if not isinstance(chunk, dict):
+        return ""
     for key in ["source_parser", "parser", "source"]:
         value = chunk.get(key)
         if value not in (None, ""):
@@ -345,24 +434,215 @@ def source_parser_for_chunk(chunk: dict[str, Any]) -> str:
 
 
 def chunk_rank(chunk: dict[str, Any]) -> Any:
+    if not isinstance(chunk, dict):
+        return ""
     return chunk.get("final_rank", chunk.get("rank", ""))
 
 
 def effective_chunk_type(chunk: dict[str, Any], table_handling: dict[str, bool]) -> str:
+    if not isinstance(chunk, dict):
+        return "text"
     chunk_type = str(chunk.get("chunk_type") or chunk.get("content_type") or "").casefold()
-    if chunk_type in {"table", "possible_table"}:
+    if chunk_type in {"table", "table_fragment", "possible_table"}:
         return chunk_type
     if table_handling["detect_tables"] and is_possible_table_text(str(chunk.get("text", ""))):
         return "possible_table"
     return "text"
 
 
+def chunk_map_by_id(chunks: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    mapped: dict[str, dict[str, Any]] = {}
+    for chunk in chunks or []:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_id = str(chunk.get("chunk_id") or "")
+        if chunk_id:
+            mapped.setdefault(chunk_id, chunk)
+    return mapped
+
+
+def merge_chunk_with_corpus(
+    chunk: dict[str, Any],
+    corpus_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(chunk, dict):
+        return {}
+    chunk_id = str(chunk.get("chunk_id") or "")
+    merged = dict(corpus_by_id.get(chunk_id, {}))
+    merged.update(chunk)
+    return merged
+
+
+def sorted_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dict_chunks = [chunk for chunk in chunks if isinstance(chunk, dict)]
+    return sorted(
+        dict_chunks,
+        key=lambda item: (
+            str(item.get("document_name") or ""),
+            str(item.get("source_parser") or item.get("parser") or item.get("source") or ""),
+            int_or_none(item.get("page_number")) or 0,
+            int_or_none(item.get("chunk_index")) or 0,
+            str(item.get("chunk_id") or ""),
+        ),
+    )
+
+
+def parent_table_context_text(chunks: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for chunk in sorted_chunks(chunks):
+        text = str(
+            chunk.get("full_table_markdown")
+            or chunk.get("table_markdown")
+            or chunk.get("parent_table_text")
+            or chunk.get("text")
+            or ""
+        ).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def related_table_chunks(
+    chunk: dict[str, Any],
+    chunks: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    if not isinstance(chunk, dict):
+        return [], ""
+    dict_chunks = [candidate for candidate in chunks if isinstance(candidate, dict)]
+    parent_id = str(chunk.get("parent_table_id") or "")
+    table_id = str(chunk.get("table_id") or "")
+    if parent_id:
+        return (
+            sorted_chunks(
+                [
+                    candidate
+                    for candidate in dict_chunks
+                    if str(candidate.get("parent_table_id") or candidate.get("table_id") or "") == parent_id
+                ]
+            ),
+            "same_parent_table_id",
+        )
+    if table_id:
+        return (
+            sorted_chunks(
+                [candidate for candidate in dict_chunks if str(candidate.get("table_id") or "") == table_id]
+            ),
+            "same_table_id",
+        )
+    return [], ""
+
+
+def expanded_context_record(
+    chunk: dict[str, Any],
+    expanded_from_chunk_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    if not isinstance(chunk, dict):
+        chunk = {}
+    return {
+        "chunk_id": chunk.get("chunk_id", ""),
+        "expanded_from_chunk_id": expanded_from_chunk_id,
+        "context_expansion_reason": reason,
+        "table_id": chunk.get("table_id", ""),
+        "parent_table_id": chunk.get("parent_table_id", ""),
+        "page_number": chunk.get("page_number", ""),
+        "section_title": chunk.get("section_title", ""),
+        "source_parser": source_parser_for_chunk(chunk),
+        "text_preview": preview_text(
+            str(chunk.get("table_markdown") or chunk.get("text") or chunk.get("parent_table_text") or ""),
+            limit=360,
+        ),
+    }
+
+
+def prepare_answer_context_chunks(
+    chunks: list[dict[str, Any]],
+    table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    handling = normalized_table_handling(table_handling)
+    corpus_by_id = chunk_map_by_id(all_chunks)
+    corpus_chunks = list(corpus_by_id.values())
+    input_chunks = [chunk for chunk in chunks if isinstance(chunk, dict)]
+    retrieved_chunk_ids = {
+        str(chunk.get("chunk_id") or "") for chunk in input_chunks if chunk.get("chunk_id")
+    }
+    context_chunks: list[dict[str, Any]] = []
+    expansion_records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_context_chunk(chunk: dict[str, Any]) -> None:
+        key = chunk_group_key(chunk)
+        if key in seen:
+            return
+        seen.add(key)
+        context_chunks.append(chunk)
+
+    for retrieved_chunk in input_chunks:
+        chunk = merge_chunk_with_corpus(retrieved_chunk, corpus_by_id)
+        chunk_type = effective_chunk_type(chunk, handling)
+        search_pool = corpus_chunks or [merge_chunk_with_corpus(item, corpus_by_id) for item in input_chunks]
+        related_chunks, reason = related_table_chunks(chunk, search_pool)
+
+        has_complete_group_context = len(related_chunks) > 1 or any(
+            item.get("full_table_markdown") or item.get("table_markdown") for item in related_chunks
+        )
+        if related_chunks and has_complete_group_context:
+            combined_context = parent_table_context_text(related_chunks)
+            context_chunk = dict(chunk)
+            context_chunk["has_full_parent_table_context"] = len(related_chunks) > 1 or bool(
+                context_chunk.get("full_table_markdown") or context_chunk.get("table_markdown")
+            )
+            context_chunk["table_context_chunk_ids"] = [
+                str(item.get("chunk_id")) for item in related_chunks if item.get("chunk_id") not in (None, "")
+            ]
+            if combined_context:
+                if any(item.get("table_markdown") or item.get("full_table_markdown") for item in related_chunks):
+                    context_chunk["full_table_markdown"] = combined_context
+                else:
+                    context_chunk["parent_table_text"] = combined_context
+            add_context_chunk(context_chunk)
+
+            expanded_from = str(chunk.get("chunk_id") or "")
+            for related_chunk in related_chunks:
+                related_id = str(related_chunk.get("chunk_id") or "")
+                if related_id and related_id not in retrieved_chunk_ids:
+                    expansion_records.append(expanded_context_record(related_chunk, expanded_from, reason))
+                add_context_chunk(related_chunk)
+            continue
+
+        if chunk_type in {"table", "table_fragment", "possible_table"}:
+            chunk = dict(chunk)
+            chunk["table_context_incomplete"] = True
+            add_context_chunk(chunk)
+            for adjacent_chunk in adjacent_context_chunks(chunk, search_pool):
+                adjacent_id = str(adjacent_chunk.get("chunk_id") or "")
+                if adjacent_id and adjacent_id not in retrieved_chunk_ids:
+                    expansion_records.append(
+                        expanded_context_record(
+                            adjacent_chunk,
+                            str(chunk.get("chunk_id") or ""),
+                            "adjacent_table_chunk_fallback",
+                        )
+                    )
+                add_context_chunk(adjacent_chunk)
+        else:
+            add_context_chunk(chunk)
+
+    return context_chunks, expansion_records
+
+
 def answer_context_text(chunk: dict[str, Any], table_handling: dict[str, bool]) -> str:
     chunk_type = effective_chunk_type(chunk, table_handling)
+    group_id = table_group_id(chunk)
     parts: list[str] = []
     header = [
         f"Rank: {chunk_rank(chunk)}" if chunk_rank(chunk) not in (None, "") else "",
         f"Chunk ID: {chunk.get('chunk_id', '')}",
+        f"Table group ID: {group_id}" if group_id else "",
+        f"Table ID: {chunk.get('table_id')}" if chunk.get("table_id") else "",
+        f"Parent table ID: {chunk.get('parent_table_id')}" if chunk.get("parent_table_id") else "",
+        "Table context incomplete: true" if chunk.get("table_context_incomplete") else "",
         f"Source parser: {source_parser_for_chunk(chunk)}" if source_parser_for_chunk(chunk) else "",
         f"Page: {chunk.get('page_number')}" if chunk.get("page_number") not in (None, "") else "",
     ]
@@ -372,17 +652,20 @@ def answer_context_text(chunk: dict[str, Any], table_handling: dict[str, bool]) 
     if chunk.get("caption"):
         parts.append(f"Caption: {chunk['caption']}")
 
-    if chunk_type == "table":
+    if chunk_type in {"table", "table_fragment"}:
         if table_handling["include_nearby_context"] and chunk.get("nearby_context"):
             parts.append(f"Nearby context:\n{chunk['nearby_context']}")
         if table_handling["include_table_json"] and chunk.get("table_json"):
             parts.append(f"Raw table JSON:\n{json.dumps(chunk['table_json'], ensure_ascii=False)}")
         table_text = (
-            chunk.get("table_markdown")
+            chunk.get("full_table_markdown")
+            or chunk.get("table_markdown")
+            or chunk.get("parent_table_text")
             if table_handling["include_full_table_context"]
             else None
         ) or chunk.get("text", "")
-        parts.append(f"Table evidence:\n{table_text}")
+        label = "Full parent table context" if chunk.get("parent_table_text") or chunk.get("full_table_markdown") else "Table evidence"
+        parts.append(f"{label}:\n{table_text}")
     elif chunk_type == "possible_table":
         if table_handling["include_nearby_context"] and chunk.get("nearby_context"):
             parts.append(f"Nearby context:\n{chunk['nearby_context']}")
@@ -395,32 +678,72 @@ def answer_context_text(chunk: dict[str, Any], table_handling: dict[str, bool]) 
 def build_answer_context(
     chunks: list[dict[str, Any]],
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
     handling = normalized_table_handling(table_handling)
+    expanded_chunks, _expansion_records = prepare_answer_context_chunks(
+        chunks,
+        handling,
+        all_chunks=all_chunks,
+    )
+
     return "\n\n---\n\n".join(
-        f"[{evidence_label(chunk)}]\n{answer_context_text(chunk, handling)}" for chunk in chunks
+        f"[{evidence_label(chunk)}]\n{answer_context_text(chunk, handling)}"
+        for chunk in expanded_chunks
     )
 
 
 def table_evidence_used(
     chunks: list[dict[str, Any]],
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     handling = normalized_table_handling(table_handling)
+    context_chunks, _expansion_records = prepare_answer_context_chunks(
+        chunks,
+        handling,
+        all_chunks=all_chunks,
+    )
+    context_by_id = chunk_map_by_id(context_chunks)
     evidence: list[dict[str, Any]] = []
     for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_id = str(chunk.get("chunk_id") or "")
+        if chunk_id and chunk_id in context_by_id:
+            chunk = context_by_id[chunk_id]
         chunk_type = effective_chunk_type(chunk, handling)
-        if chunk_type not in {"table", "possible_table"}:
+        if chunk_type not in {"table", "table_fragment", "possible_table"}:
             continue
         has_table_markdown = chunk.get("table_markdown") not in (None, "")
-        preview_source = chunk.get("table_markdown") if has_table_markdown else chunk.get("text", "")
+        if has_table_markdown:
+            preview_source = chunk.get("full_table_markdown") or chunk.get("table_markdown")
+        else:
+            preview_source = chunk.get("parent_table_text") or chunk.get("text", "")
         item = {
             "chunk_id": chunk.get("chunk_id", ""),
             "chunk_type": chunk_type,
+            "table_id": chunk.get("table_id", ""),
+            "parent_table_id": chunk.get("parent_table_id", ""),
             "page_number": chunk.get("page_number", ""),
             "section_title": chunk.get("section_title", ""),
             "source_parser": source_parser_for_chunk(chunk),
+            "has_full_parent_table_context": bool(chunk.get("has_full_parent_table_context")),
+            "table_context_incomplete": not bool(chunk.get("has_full_parent_table_context"))
+            and chunk_type in {"table_fragment", "possible_table"},
         }
+        if not table_group_id(chunk):
+            adjacent_chunk_ids = sorted(
+                {
+                    str(record.get("chunk_id"))
+                    for record in _expansion_records
+                    if record.get("expanded_from_chunk_id") == chunk.get("chunk_id")
+                    and record.get("context_expansion_reason") == "adjacent_table_chunk_fallback"
+                    and record.get("chunk_id") not in (None, "")
+                }
+            )
+            if adjacent_chunk_ids:
+                item["adjacent_context_chunk_ids"] = adjacent_chunk_ids
         if chunk.get("final_rank") not in (None, ""):
             item["final_rank"] = chunk.get("final_rank")
         elif chunk.get("rank") not in (None, ""):
@@ -439,18 +762,25 @@ def build_answer_prompt(
     question: str,
     chunks: list[dict[str, Any]],
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
-    context = build_answer_context(chunks, table_handling)
-    return f"""You answer technical-document questions using only retrieved chunks.
+    context = build_answer_context(chunks, table_handling, all_chunks=all_chunks)
+    return f"""You answer technical-document questions using only retrieved and expanded context.
 
 Rules:
-- Use only the retrieved context below.
+- Use only the retrieved and expanded context below.
 - Do not use outside knowledge.
 - Do not hallucinate fields, values, sections, or requirements.
 - Pay special attention to table evidence.
+- Some table evidence may be split across multiple chunks.
+- If table fragments are grouped by table_id or parent_table_id, treat them as one table.
+- If the context contains a value table, list all relevant value-description pairs.
+- Preserve exact value codes such as 000b, 001b, and 010b.
+- Do not stop after the first table row.
 - If a table lists values, preserve the value-to-description relationship.
 - Do not invent table values.
 - Do not infer values that are not in the table.
+- If only partial table evidence is available, state that the table evidence appears incomplete.
 - If table evidence is insufficient or unclear, say so clearly.
 - If the retrieved chunks are insufficient, say so clearly.
 - Keep the answer concise and technical.
@@ -475,6 +805,7 @@ def generate_answer(
     chunks: list[dict[str, Any]],
     answer_model: str,
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
     if not chunks:
         return (
@@ -492,7 +823,7 @@ def generate_answer(
 
     response = ollama.generate(
         model=answer_model,
-        prompt=build_answer_prompt(question, chunks, table_handling),
+        prompt=build_answer_prompt(question, chunks, table_handling, all_chunks=all_chunks),
         options={"temperature": 0.1},
     )
     return str(response["response"]).strip()
@@ -502,10 +833,16 @@ def generate_answers(
     retrieval_records: list[dict[str, Any]],
     answer_model: str,
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     answers: list[dict[str, Any]] = []
     for record in retrieval_records:
         chunks = record["retrieved_chunks"]
+        _context_chunks, expansion_records = prepare_answer_context_chunks(
+            chunks,
+            table_handling,
+            all_chunks=all_chunks,
+        )
         answers.append(
             {
                 "run_id": record["run_id"],
@@ -517,12 +854,18 @@ def generate_answers(
                 "question_id": record["question_id"],
                 "question": record["question"],
                 "retrieved_chunks": chunks,
-                "table_evidence_used": table_evidence_used(chunks, table_handling),
+                "table_evidence_used": table_evidence_used(
+                    chunks,
+                    table_handling,
+                    all_chunks=all_chunks,
+                ),
+                "expanded_context_chunks": expansion_records,
                 "generated_answer": generate_answer(
                     question=str(record["question"]),
                     chunks=chunks,
                     answer_model=answer_model,
                     table_handling=table_handling,
+                    all_chunks=all_chunks,
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -594,10 +937,16 @@ def chunk_record(
         chunk,
         source_parser=source_parser,
         table_id=str(source_record["table_id"]) if source_record.get("table_id") else None,
+        parent_table_id=(
+            str(source_record["parent_table_id"]) if source_record.get("parent_table_id") else None
+        ),
         table_markdown=str(source_record["table_markdown"]) if source_record.get("table_markdown") else None,
         nearby_context=str(source_record["nearby_context"]) if source_record.get("nearby_context") else None,
         caption=str(source_record["caption"]) if source_record.get("caption") else None,
     )
+    for key in TABLE_METADATA_KEYS:
+        if key not in chunk and source_record.get(key) not in (None, ""):
+            chunk[key] = source_record[key]
     return chunk
 
 
@@ -758,6 +1107,7 @@ def create_chunks_for_strategy(
             chunk["source_parser"] = parser_id
             if "chunk_type" not in chunk:
                 add_table_metadata(chunk, source_parser=parser_id)
+        assign_table_group_ids(chunks)
         if chunking_strategy == "parent-child table context":
             warnings.append(
                 "parent-child table context currently stores table nearby_context metadata when available; "
@@ -766,10 +1116,12 @@ def create_chunks_for_strategy(
         return chunks, warnings
 
     if chunking_strategy == "page-based":
-        return create_page_based_chunks(extracted_records, chunk_size, chunk_overlap)
+        chunks, warnings = create_page_based_chunks(extracted_records, chunk_size, chunk_overlap)
+        return assign_table_group_ids(chunks), warnings
 
     if chunking_strategy == "section-aware":
-        return create_section_aware_chunks(parser_id, extracted_records, chunk_size, chunk_overlap)
+        chunks, warnings = create_section_aware_chunks(parser_id, extracted_records, chunk_size, chunk_overlap)
+        return assign_table_group_ids(chunks), warnings
 
     raise ValueError(f"Unsupported chunking strategy: {chunking_strategy}")
 
@@ -1285,10 +1637,16 @@ def generate_fusion_answers(
     fused_records: list[dict[str, Any]],
     answer_model: str,
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     answers: list[dict[str, Any]] = []
     for record in fused_records:
         chunks = record["fused_chunks"]
+        _context_chunks, expansion_records = prepare_answer_context_chunks(
+            chunks,
+            table_handling,
+            all_chunks=all_chunks,
+        )
         answers.append(
             {
                 "run_id": record["run_id"],
@@ -1301,12 +1659,18 @@ def generate_fusion_answers(
                 "question_id": record["question_id"],
                 "question": record["question"],
                 "fused_chunks": chunks,
-                "table_evidence_used": table_evidence_used(chunks, table_handling),
+                "table_evidence_used": table_evidence_used(
+                    chunks,
+                    table_handling,
+                    all_chunks=all_chunks,
+                ),
+                "expanded_context_chunks": expansion_records,
                 "generated_answer": generate_answer(
                     question=str(record["question"]),
                     chunks=chunks,
                     answer_model=answer_model,
                     table_handling=table_handling,
+                    all_chunks=all_chunks,
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -1419,10 +1783,16 @@ def generate_parser_fusion_answers(
     fused_records: list[dict[str, Any]],
     answer_model: str,
     table_handling: dict[str, Any] | None = None,
+    all_chunks: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     answers: list[dict[str, Any]] = []
     for record in fused_records:
         chunks = record["fused_chunks"]
+        _context_chunks, expansion_records = prepare_answer_context_chunks(
+            chunks,
+            table_handling,
+            all_chunks=all_chunks,
+        )
         answers.append(
             {
                 "run_id": record["run_id"],
@@ -1435,12 +1805,18 @@ def generate_parser_fusion_answers(
                 "question_id": record["question_id"],
                 "question": record["question"],
                 "fused_chunks": chunks,
-                "table_evidence_used": table_evidence_used(chunks, table_handling),
+                "table_evidence_used": table_evidence_used(
+                    chunks,
+                    table_handling,
+                    all_chunks=all_chunks,
+                ),
+                "expanded_context_chunks": expansion_records,
                 "generated_answer": generate_answer(
                     question=str(record["question"]),
                     chunks=chunks,
                     answer_model=answer_model,
                     table_handling=table_handling,
+                    all_chunks=all_chunks,
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -1799,6 +2175,7 @@ def run_parser_compare(
             result["retrieval_records"],
             answer_model,
             table_handling=table_handling,
+            all_chunks=chunks_by_parser.get(parser_id, []),
         )
         write_jsonl(answer_records, parser_dir / "answer_results.jsonl")
         result["answer_records"] = answer_records
@@ -1994,6 +2371,7 @@ def run_chunking_compare(
             result["retrieval_records"],
             answer_model,
             table_handling=table_handling,
+            all_chunks=chunks_by_strategy.get(strategy, []),
         )
         write_jsonl(answer_records, strategy_dir / "answer_results.jsonl")
         result["answer_records"] = answer_records
@@ -2209,6 +2587,7 @@ def run_embedding_compare(
             result["retrieval_records"],
             answer_model,
             table_handling=table_handling,
+            all_chunks=chunks,
         )
         write_jsonl(answer_records, model_dir / "answer_results.jsonl")
         result["answer_records"] = answer_records
@@ -2461,6 +2840,7 @@ def run_retrieval_fusion_compare(
         fused_records,
         answer_model,
         table_handling=table_handling,
+        all_chunks=chunks,
     )
     write_jsonl(answer_records, fusion_dir / "answer_results.jsonl")
 
@@ -2695,6 +3075,7 @@ def run_parser_fusion_compare(
         fused_records,
         answer_model,
         table_handling=table_handling,
+        all_chunks=[chunk for parser_chunks in chunks_by_parser.values() for chunk in parser_chunks],
     )
     write_jsonl(answer_records, fusion_dir / "answer_results.jsonl")
 

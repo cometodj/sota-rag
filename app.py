@@ -902,6 +902,8 @@ def get_chunk_type_label(chunk: dict[str, Any]) -> str:
     chunk_type = str(chunk.get("chunk_type") or chunk.get("content_type") or "").casefold()
     if chunk_type == "table":
         return "[Table Chunk]"
+    if chunk_type == "table_fragment":
+        return "[Table Fragment]"
     if chunk.get("contains_table") is True or is_possible_table_chunk(chunk.get("text", "")):
         return "[Possible Table Chunk]"
     return "[Text Chunk]"
@@ -919,7 +921,7 @@ def count_table_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
 
     for chunk in chunks:
         label = table_chunk_label(chunk)
-        if label == "[Table Chunk]":
+        if label in {"[Table Chunk]", "[Table Fragment]"}:
             table_chunks += 1
         elif label == "[Possible Table Chunk]":
             possible_table_chunks += 1
@@ -956,7 +958,9 @@ def render_table_summary(chunks: list[dict[str, Any]]) -> None:
 
 def table_like_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
-        chunk for chunk in chunks if table_chunk_label(chunk) in {"[Table Chunk]", "[Possible Table Chunk]"}
+        chunk
+        for chunk in chunks
+        if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]", "[Possible Table Chunk]"}
     ]
 
 
@@ -976,7 +980,11 @@ def chunk_source_parsers(chunk: dict[str, Any]) -> list[str]:
 
 
 def summarize_table_evidence(chunks: list[dict[str, Any]]) -> dict[str, Any]:
-    confirmed = [chunk for chunk in chunks if table_chunk_label(chunk) == "[Table Chunk]"]
+    confirmed = [
+        chunk
+        for chunk in chunks
+        if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]"}
+    ]
     possible = [chunk for chunk in chunks if table_chunk_label(chunk) == "[Possible Table Chunk]"]
     evidence_chunks = confirmed + possible
     pages = {
@@ -1862,6 +1870,11 @@ def parser_fusion_chunk_metadata(chunk: dict[str, Any], fused: bool) -> dict[str
     metadata = {
         "chunk_type": table_chunk_label(chunk),
         "chunk_id": first_present(chunk, ["chunk_id"]),
+        "table_id": first_present(chunk, ["table_id"]),
+        "parent_table_id": first_present(chunk, ["parent_table_id"]),
+        "table_group_index": first_present(chunk, ["table_group_index"]),
+        "table_fragment_index": first_present(chunk, ["table_fragment_index"]),
+        "table_value_codes": display_value(first_present(chunk, ["table_value_codes"], [])),
         "rank": first_present(chunk, ["final_rank", "rank"]),
         "parser/source": display_value(chunk_source_parsers(chunk)),
         "page_number": first_present(chunk, ["page_number"]),
@@ -1896,10 +1909,16 @@ def render_table_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
         st.write(parser_fusion_chunk_metadata(chunk, fused=fused))
 
         table_markdown = chunk.get("table_markdown") or chunk.get("markdown_table")
+        parent_table_context = chunk.get("full_table_markdown") or chunk.get("parent_table_text")
         table_json = chunk.get("table_json") or chunk.get("raw_table_json")
         text = str(chunk.get("text") or "")
 
-        if table_markdown:
+        if parent_table_context:
+            st.markdown("##### Full Parent Table Context")
+            st.code(str(parent_table_context), language="markdown")
+            with st.expander("Rendered Parent Table Context", expanded=False):
+                st.markdown(str(parent_table_context))
+        elif table_markdown:
             st.markdown("##### Table Content")
             st.markdown(str(table_markdown))
             with st.expander("Table Content Source", expanded=False):
@@ -1943,6 +1962,10 @@ def answer_table_evidence_records(answer_record: dict[str, Any] | None) -> list[
         evidence_record = {
             "chunk_id": chunk.get("chunk_id", ""),
             "chunk_type": table_chunk_label(chunk).strip("[]"),
+            "table_id": chunk.get("table_id", ""),
+            "parent_table_id": chunk.get("parent_table_id", ""),
+            "has_full_parent_table_context": bool(chunk.get("has_full_parent_table_context")),
+            "table_context_incomplete": bool(chunk.get("table_context_incomplete")),
             "page_number": chunk.get("page_number", ""),
             "section_title": chunk.get("section_title", ""),
             "source_parser": ", ".join(chunk_source_parsers(chunk)),
@@ -1971,10 +1994,17 @@ def render_table_evidence_used(answer_record: dict[str, Any] | None) -> None:
             {
                 "chunk_id": record.get("chunk_id", "N/A"),
                 "chunk_type": record.get("chunk_type", "N/A"),
+                "table_id": record.get("table_id", "N/A"),
+                "parent_table_id": record.get("parent_table_id", "N/A"),
+                "has_full_parent_table_context": record.get("has_full_parent_table_context", "N/A"),
+                "table_context_incomplete": record.get("table_context_incomplete", "N/A"),
                 "page_number": record.get("page_number", "N/A"),
                 "section_title": record.get("section_title", "N/A"),
                 "source_parser": record.get("source_parser", "N/A"),
                 "rank": record.get("final_rank", record.get("rank", "N/A")),
+                "adjacent_context_chunk_ids": display_value(
+                    record.get("adjacent_context_chunk_ids", [])
+                ),
                 "caption": record.get("caption", "N/A"),
                 "table_markdown_preview": record.get(
                     "table_markdown_preview",
@@ -1990,6 +2020,61 @@ def render_table_evidence_used(answer_record: dict[str, Any] | None) -> None:
                 st.json(record)
 
 
+def render_expanded_context_chunks(answer_record: dict[str, Any] | None) -> None:
+    records = []
+    if answer_record and isinstance(answer_record.get("expanded_context_chunks"), list):
+        records = [
+            item
+            for item in answer_record.get("expanded_context_chunks", [])
+            if isinstance(item, dict)
+        ]
+
+    with st.expander("Expanded Table Context Used", expanded=False):
+        if not records:
+            st.info("No expanded table context was recorded for this answer.")
+            return
+
+        rows = [
+            {
+                "expanded_chunk_id": record.get("chunk_id", "N/A"),
+                "expanded_from_chunk_id": record.get("expanded_from_chunk_id", "N/A"),
+                "context_expansion_reason": record.get("context_expansion_reason", "N/A"),
+                "table_id": record.get("table_id", "N/A"),
+                "parent_table_id": record.get("parent_table_id", "N/A"),
+                "page_number": record.get("page_number", "N/A"),
+                "section_title": record.get("section_title", "N/A"),
+                "source_parser": record.get("source_parser", "N/A"),
+                "text_preview": record.get("text_preview", ""),
+            }
+            for record in records
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+        value_codes: list[str] = []
+        grouped_chunk_ids: list[str] = []
+        for record in records:
+            if record.get("chunk_id") not in (None, ""):
+                grouped_chunk_ids.append(str(record.get("chunk_id")))
+            preview = str(record.get("text_preview") or "")
+            value_codes.extend(re.findall(r"\b(?:[01]{2,8}b|[0-9A-Fa-f]{2,8}h|\d{1,2}:\d{1,2})\b", preview))
+
+        st.markdown("##### Table Group Diagnostics")
+        st.markdown(
+            "\n".join(
+                [
+                    f"- Expanded table fragments: {len(records)}",
+                    f"- Expanded chunk IDs: {', '.join(unique_preserve_order(grouped_chunk_ids)) or 'N/A'}",
+                    f"- Detected value codes: {', '.join(unique_preserve_order(value_codes)) or 'N/A'}",
+                ]
+            )
+        )
+
+        for record in records:
+            chunk_id = record.get("chunk_id", "N/A")
+            with st.expander(f"Raw expanded context JSON - {chunk_id}", expanded=False):
+                st.json(record)
+
+
 def render_text_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
     rank = first_present(chunk, ["final_rank", "rank"], "N/A")
     chunk_id = first_present(chunk, ["chunk_id"], "N/A")
@@ -2002,7 +2087,7 @@ def render_text_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
 
 
 def render_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
-    if table_chunk_label(chunk) in {"[Table Chunk]", "[Possible Table Chunk]"}:
+    if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]", "[Possible Table Chunk]"}:
         render_table_chunk_card(chunk, fused=fused)
     else:
         render_text_chunk_card(chunk, fused=fused)
@@ -2163,6 +2248,7 @@ def render_parser_fusion_existing_results_browser() -> None:
         st.caption(f"Answer model: `{answer_record.get('answer_model', 'N/A')}`")
         st.markdown(str(answer_record.get("generated_answer") or "N/A"))
         render_table_evidence_used(answer_record)
+        render_expanded_context_chunks(answer_record)
         evidence = answer_record.get("evidence_used") or answer_record.get("evidence")
         if evidence:
             st.markdown("##### Evidence Used")
@@ -2443,6 +2529,7 @@ def render_answer_case(case_record: dict[str, Any]) -> None:
     with st.expander("Full generated answer", expanded=False):
         st.markdown(str(case_record.get("generated_answer") or "N/A"))
     render_table_evidence_used(case_record)
+    render_expanded_context_chunks(case_record)
     with st.expander("Retrieved or fused chunks", expanded=False):
         chunks = answer_context_chunks(case_record)
         if chunks:
@@ -2766,6 +2853,7 @@ def render_parser_compare_results(runner_result: dict[str, Any]) -> None:
             st.markdown("##### Generated Answer")
             st.markdown(str(record.get("generated_answer", "")))
             render_table_evidence_used(record)
+            render_expanded_context_chunks(record)
             st.markdown("##### Retrieved Chunks")
             render_chunk_table(
                 record.get("retrieved_chunks", []),
@@ -2858,6 +2946,7 @@ def render_chunking_compare_results(runner_result: dict[str, Any]) -> None:
             st.markdown("##### Generated Answer")
             st.markdown(str(record.get("generated_answer", "")))
             render_table_evidence_used(record)
+            render_expanded_context_chunks(record)
             st.markdown("##### Retrieved Chunks")
             render_chunk_table(
                 record.get("retrieved_chunks", []),
@@ -2951,6 +3040,7 @@ def render_embedding_compare_results(runner_result: dict[str, Any]) -> None:
             st.markdown("##### Generated Answer")
             st.markdown(str(record.get("generated_answer", "")))
             render_table_evidence_used(record)
+            render_expanded_context_chunks(record)
             st.markdown("##### Retrieved Chunks")
             render_chunk_table(
                 record.get("retrieved_chunks", []),
@@ -3015,6 +3105,7 @@ def render_retrieval_fusion_results(runner_result: dict[str, Any]) -> None:
     st.markdown("#### Generated Answer")
     st.markdown(str(answer_record.get("generated_answer", "")))
     render_table_evidence_used(answer_record)
+    render_expanded_context_chunks(answer_record)
 
     st.markdown("#### Fused Chunks")
     fused_chunks = fused_record.get("fused_chunks", [])
@@ -3078,6 +3169,7 @@ def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
     st.markdown("#### Generated Answer")
     st.markdown(str(answer_record.get("generated_answer", "")))
     render_table_evidence_used(answer_record)
+    render_expanded_context_chunks(answer_record)
 
     st.markdown("#### Fused Chunks")
     fused_chunks = fused_record.get("fused_chunks", [])

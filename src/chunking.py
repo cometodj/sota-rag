@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from table_aware import add_table_metadata
+from table_aware import add_table_metadata, assign_table_group_ids
 
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
@@ -103,7 +103,7 @@ def create_chunks(
             add_table_metadata(chunk, source_parser="pymupdf")
             chunks.append(chunk)
 
-    return chunks
+    return assign_table_group_ids(chunks)
 
 
 def run(config_path: Path = DEFAULT_CONFIG_PATH) -> Path:
