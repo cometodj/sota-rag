@@ -270,6 +270,16 @@ def add_table_metadata(
     elif parent_table_id:
         chunk["parent_table_id"] = parent_table_id
     if table_markdown:
+        searchable_parts = [
+            str(chunk.get("section_title") or ""),
+            str(caption or ""),
+            str(nearby_context or ""),
+            table_markdown,
+        ]
+        searchable_text = "\n\n".join(part for part in searchable_parts if part.strip())
+        if searchable_text and table_markdown not in chunk_text:
+            chunk["text"] = "\n\n".join(part for part in [chunk_text, searchable_text] if part.strip())
+            chunk["char_count"] = len(str(chunk["text"]))
         chunk["table_markdown"] = table_markdown
         chunk.setdefault("full_table_markdown", table_markdown)
     if nearby_context:

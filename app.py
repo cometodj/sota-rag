@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import subprocess
 import sys
@@ -101,6 +102,29 @@ def unique_preserve_order(values: list[str]) -> list[str]:
             unique_values.append(value)
             seen.add(value)
     return unique_values
+
+
+def slugify(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
+    return normalized or "value"
+
+
+def benchmark_collection_name(parser_id: str, embedding_model_name: str, run_id: str) -> str:
+    digest = hashlib.sha1(f"{parser_id}|{embedding_model_name}|{run_id}".encode("utf-8")).hexdigest()
+    return f"{slugify(parser_id)[:16]}_{digest[:16]}"
+
+
+def benchmark_strategy_collection_name(
+    run_id: str,
+    parser_id: str,
+    chunking_strategy: str,
+    embedding_model_name: str,
+) -> str:
+    embedding_slug = slugify(embedding_model_name.split("/")[-1])
+    strategy_slug = slugify(chunking_strategy)
+    base = f"{slugify(run_id)[:18]}__{slugify(parser_id)}__{strategy_slug}__{embedding_slug}"
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+    return f"{base[:54].strip('_')}_{digest}"
 
 
 def get_default_table_handling_config() -> dict[str, bool]:
@@ -289,6 +313,22 @@ def save_setup_only_run_config(
     questions_path.write_bytes(BENCHMARK_QUESTIONS_PATH.read_bytes())
 
     run_config["uploaded_pdf_path"] = str(uploaded_pdf_path)
+    run_config["benchmark_questions_source_path"] = str(BENCHMARK_QUESTIONS_PATH)
+    run_config["benchmark_questions_path"] = str(questions_path)
+
+    config_path = run_dir / "run_config.yaml"
+    config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
+    return run_id, run_dir, config_path
+
+
+def save_config_only_run_config(run_config: dict[str, Any]) -> tuple[str, Path, Path]:
+    run_id = str(run_config["run_id"])
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    questions_path = run_dir / "benchmark_questions.jsonl"
+    questions_path.write_bytes(BENCHMARK_QUESTIONS_PATH.read_bytes())
+
     run_config["benchmark_questions_source_path"] = str(BENCHMARK_QUESTIONS_PATH)
     run_config["benchmark_questions_path"] = str(questions_path)
 
@@ -875,6 +915,14 @@ def chunk_rows(chunks: list[dict[str, Any]], highlight_ids: set[str] | None = No
                 "caption": chunk.get("caption", chunk.get("table_caption", "")),
                 "parser_source": chunk.get("parser", chunk.get("source", "")),
                 "chunk_index": chunk.get("chunk_index", ""),
+                "retrieval_query_source": chunk.get(
+                    "retrieval_query_source",
+                    display_value(chunk.get("retrieval_query_sources", {})),
+                ),
+                "retrieval_query": chunk.get(
+                    "retrieval_query",
+                    display_value(chunk.get("retrieved_by_queries", [])),
+                ),
                 "score_or_distance": score_or_distance,
                 "expanded_only": chunk_id in highlight_ids,
                 "text_preview": preview_text(chunk.get("text", "")),
@@ -1713,6 +1761,12 @@ def render_result_area(run_dir: Path, experiment_type: str) -> None:
             run_dir / "parser_fusion" / "answer_results.jsonl",
             run_dir / "reports" / "parser_fusion_comparison_report.md",
         ],
+        "multi_query_retrieval_compare": [
+            run_dir / "original" / "retrieval_results.jsonl",
+            run_dir / "multi_query" / "fused_retrieval_results.jsonl",
+            run_dir / "multi_query" / "answer_results.jsonl",
+            run_dir / "reports" / "multi_query_retrieval_comparison_report.md",
+        ],
     }
     existing_paths = [
         path for path in result_paths_by_experiment.get(experiment_type, []) if path.exists()
@@ -1883,6 +1937,14 @@ def parser_fusion_chunk_metadata(chunk: dict[str, Any], fused: bool) -> dict[str
         "score/distance/fusion_score": first_present(
             chunk,
             ["fusion_score", "score", "distance", "similarity"],
+        ),
+        "retrieval_query_source": first_present(
+            chunk,
+            ["retrieval_query_source", "retrieval_query_sources"],
+        ),
+        "retrieval_query": first_present(
+            chunk,
+            ["retrieval_query", "retrieved_by_queries"],
         ),
     }
     if fused:
@@ -2055,6 +2117,7 @@ def render_expanded_context_chunks(answer_record: dict[str, Any] | None) -> None
                 "section_title": record.get("section_title", "N/A"),
                 "source_parser": record.get("source_parser", "N/A"),
                 "text_preview": record.get("text_preview", ""),
+                "table_markdown_preview": record.get("table_markdown_preview", ""),
             }
             for record in records
         ]
@@ -2062,18 +2125,28 @@ def render_expanded_context_chunks(answer_record: dict[str, Any] | None) -> None
 
         value_codes: list[str] = []
         grouped_chunk_ids: list[str] = []
+        following_records = [
+            record
+            for record in records
+            if record.get("context_expansion_reason") == "following_table_reference"
+        ]
         for record in records:
             if record.get("chunk_id") not in (None, ""):
                 grouped_chunk_ids.append(str(record.get("chunk_id")))
             preview = str(record.get("text_preview") or "")
+            if record.get("table_markdown_preview"):
+                preview = f"{preview}\n{record.get('table_markdown_preview')}"
             value_codes.extend(re.findall(r"\b(?:[01]{2,8}b|[0-9A-Fa-f]{2,8}h|\d{1,2}:\d{1,2})\b", preview))
 
         st.markdown("##### Table Group Diagnostics")
         st.markdown(
             "\n".join(
                 [
+                    f"- Following table expansion applied: {'Yes' if following_records else 'No'}",
                     f"- Expanded table fragments: {len(records)}",
                     f"- Expanded chunk IDs: {', '.join(unique_preserve_order(grouped_chunk_ids)) or 'N/A'}",
+                    "- Expanded following table chunk IDs: "
+                    f"{', '.join(unique_preserve_order([str(record.get('chunk_id')) for record in following_records if record.get('chunk_id') not in (None, '')])) or 'N/A'}",
                     f"- Detected value codes: {', '.join(unique_preserve_order(value_codes)) or 'N/A'}",
                 ]
             )
@@ -2302,6 +2375,189 @@ def list_benchmark_runs() -> list[tuple[str, Path, dict[str, Any]]]:
     return runs
 
 
+def multi_query_index_candidates() -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for run_id, run_dir, run_config in list_benchmark_runs():
+        chroma_path = run_dir / "chroma"
+        if not chroma_path.exists():
+            continue
+        experiment_type = str(run_config.get("experiment_type", ""))
+        chunking_strategy = str(run_config.get("chunking_strategy") or "")
+
+        def add_candidate(
+            *,
+            parser: str,
+            embedding_model: str,
+            chunks_path: Path,
+            collection_name: str,
+            label_suffix: str = "",
+        ) -> None:
+            if not parser or not embedding_model or not chunks_path.exists():
+                return
+            candidates.append(
+                {
+                    "label": (
+                        f"{run_id} | {experiment_type} | {parser} | "
+                        f"{chunking_strategy} | {embedding_model}{label_suffix}"
+                    ),
+                    "source_run_id": run_id,
+                    "uploaded_pdf_path": str(run_config.get("uploaded_pdf_path") or ""),
+                    "source_chroma_path": str(chroma_path),
+                    "source_chunks_path": str(chunks_path),
+                    "source_collection_name": collection_name,
+                    "collection_name": collection_name,
+                    "parser": parser,
+                    "chunking_strategy": chunking_strategy,
+                    "embedding_model": embedding_model,
+                    "experiment_type": experiment_type,
+                }
+            )
+
+        if experiment_type in {"parser_compare", "parser_fusion_compare"}:
+            embedding_model = str(run_config.get("embedding_model") or "")
+            parsers = run_config.get("selected_parsers") or []
+            for parser in parsers:
+                add_candidate(
+                    parser=str(parser),
+                    embedding_model=embedding_model,
+                    chunks_path=run_dir / str(parser) / "chunks.jsonl",
+                    collection_name=(
+                        benchmark_collection_name(str(parser), embedding_model, run_id)
+                        if experiment_type == "parser_compare"
+                        else benchmark_strategy_collection_name(
+                            run_id,
+                            str(parser),
+                            chunking_strategy,
+                            embedding_model,
+                        )
+                    ),
+                )
+        elif experiment_type == "embedding_compare":
+            parser = str(run_config.get("parser") or "")
+            for model in run_config.get("selected_embedding_models") or []:
+                add_candidate(
+                    parser=parser,
+                    embedding_model=str(model),
+                    chunks_path=run_dir / "chunks" / "chunks.jsonl",
+                    collection_name=benchmark_strategy_collection_name(
+                        run_id,
+                        parser,
+                        chunking_strategy,
+                        str(model),
+                    ),
+                    label_suffix=f" | {safe_profile_name(str(model))}",
+                )
+        elif experiment_type == "retrieval_fusion_compare":
+            parser = str(run_config.get("parser") or "")
+            for model in run_config.get("selected_embedding_models") or []:
+                add_candidate(
+                    parser=parser,
+                    embedding_model=str(model),
+                    chunks_path=run_dir / "chunks" / "chunks.jsonl",
+                    collection_name=benchmark_strategy_collection_name(
+                        run_id,
+                        parser,
+                        chunking_strategy,
+                        str(model),
+                    ),
+                    label_suffix=f" | {safe_profile_name(str(model))}",
+                )
+        elif experiment_type == "chunking_compare":
+            parser = str(run_config.get("parser") or "")
+            embedding_model = str(run_config.get("embedding_model") or "")
+            for strategy in run_config.get("selected_chunking_strategies") or []:
+                old_strategy = chunking_strategy
+                chunking_strategy = str(strategy)
+                add_candidate(
+                    parser=parser,
+                    embedding_model=embedding_model,
+                    chunks_path=run_dir / str(strategy) / "chunks.jsonl",
+                    collection_name=benchmark_strategy_collection_name(
+                        run_id,
+                        parser,
+                        str(strategy),
+                        embedding_model,
+                    ),
+                )
+                chunking_strategy = old_strategy
+    return candidates
+
+
+def build_multi_query_preview(
+    benchmark_questions: list[dict[str, Any]],
+    max_sub_queries: int,
+) -> tuple[dict[str, list[str]], dict[str, list[dict[str, str]]], dict[str, Any]]:
+    from benchmark_runner import decompose_query_rule_based, reject_sub_query_reason
+
+    accepted_by_question: dict[str, list[str]] = {}
+    rejected_by_question: dict[str, list[dict[str, str]]] = {}
+    preview_by_question: dict[str, Any] = {}
+
+    st.markdown("#### Controlled Query Expansion Preview")
+    st.caption(
+        "Review conservative phrase-level sub-queries before retrieval. "
+        "The original query is always included, and unchecked phrases are saved as rejected."
+    )
+
+    for question in benchmark_questions:
+        question_id = str(question.get("id", ""))
+        question_text = str(question.get("question", ""))
+        if not question_id or not question_text:
+            continue
+        decomposition = decompose_query_rule_based(question_text, max_sub_queries=int(max_sub_queries))
+        generated = [str(query) for query in decomposition.get("generated_sub_queries", [])]
+        rejected = [
+            item for item in decomposition.get("rejected_sub_queries", [])
+            if isinstance(item, dict)
+        ]
+        anchors = [str(anchor) for anchor in decomposition.get("anchors", [])]
+        required_anchors = [str(anchor) for anchor in decomposition.get("required_anchors", [])]
+        accepted: list[str] = []
+
+        with st.expander(f"{question_id}: {question_text}", expanded=False):
+            st.write(
+                {
+                    "required_anchors": required_anchors,
+                    "detected_anchors": anchors,
+                }
+            )
+            for index, query in enumerate(generated):
+                source = decomposition.get("query_sources", {}).get(query, "phrase_decomposition")
+                rejection_reason = reject_sub_query_reason(query, question_text, anchors)
+                is_original = source == "original" or query.casefold() == question_text.casefold()
+                if rejection_reason and not is_original:
+                    st.warning(f"Rejected: {query} ({rejection_reason})")
+                    rejected.append({"query": query, "reason": rejection_reason})
+                    continue
+                checked = st.checkbox(
+                    f"{query} [{source}]",
+                    value=True,
+                    disabled=is_original,
+                    key=f"multi_query_accept_{question_id}_{index}",
+                )
+                if checked or is_original:
+                    accepted.append(query)
+                else:
+                    rejected.append({"query": query, "reason": "user_unchecked"})
+
+            if rejected:
+                with st.expander("Rejected or unchecked sub-queries", expanded=False):
+                    st.write(rejected)
+
+        accepted_by_question[question_id] = unique_preserve_order(accepted)
+        rejected_by_question[question_id] = rejected
+        preview_by_question[question_id] = {
+            "question": question_text,
+            "accepted_sub_queries": accepted_by_question[question_id],
+            "rejected_sub_queries": rejected,
+            "anchors": anchors,
+            "required_anchors": required_anchors,
+            "query_sources": decomposition.get("query_sources", {}),
+        }
+
+    return accepted_by_question, rejected_by_question, preview_by_question
+
+
 def discover_answer_result_files(
     run_dir: Path,
     run_config: dict[str, Any],
@@ -2334,6 +2590,9 @@ def discover_answer_result_files(
 
     if experiment_type == "parser_fusion_compare":
         return [("parser fusion result", run_dir / "parser_fusion" / "answer_results.jsonl")]
+
+    if experiment_type == "multi_query_retrieval_compare":
+        return [("multi-query result", run_dir / "multi_query" / "answer_results.jsonl")]
 
     return []
 
@@ -2475,6 +2734,8 @@ def profile_defaults(run_id: str, run_config: dict[str, Any]) -> dict[str, Any]:
     if experiment_type == "retrieval_fusion_compare":
         embedding_mode = "multi_embedding_fusion"
         retrieval_strategy = "multi_embedding_fusion"
+    if experiment_type == "multi_query_retrieval_compare":
+        retrieval_strategy = "multi_query_rrf"
 
     return {
         "document_id": Path(file_name).stem or run_id,
@@ -2491,7 +2752,9 @@ def profile_defaults(run_id: str, run_config: dict[str, Any]) -> dict[str, Any]:
         "top_k": run_config.get("top_k", run_config.get("final_top_k", "")),
         "per_model_top_k": run_config.get("per_model_top_k", ""),
         "per_parser_top_k": run_config.get("per_parser_top_k", ""),
+        "per_query_top_k": run_config.get("per_query_top_k", ""),
         "final_top_k": run_config.get("final_top_k", ""),
+        "max_sub_queries": run_config.get("max_sub_queries", ""),
         "answer_model": run_config.get("answer_model", ""),
         "table_handling": run_config.get("table_handling", get_default_table_handling_config()),
         "notes": "",
@@ -2511,12 +2774,16 @@ def render_run_config_summary(run_config: dict[str, Any]) -> None:
         "embedding_model",
         "selected_embedding_models",
         "retrieval_strategy",
+        "use_existing_index",
+        "source_index",
         "fusion_method",
         "table_handling",
         "answer_model",
         "top_k",
         "per_model_top_k",
         "per_parser_top_k",
+        "per_query_top_k",
+        "max_sub_queries",
         "final_top_k",
     ]
     st.write({key: run_config.get(key, "N/A") for key in summary_keys if key in run_config})
@@ -3193,6 +3460,121 @@ def render_parser_fusion_results(runner_result: dict[str, Any]) -> None:
     render_chunk_table(fused_chunks, "No fused chunks found for this question.")
 
 
+def render_multi_query_retrieval_results(runner_result: dict[str, Any]) -> None:
+    st.subheader("Controlled Query Expansion Results")
+    st.write(
+        {
+            "run_id": runner_result.get("run_id"),
+            "run_dir": runner_result.get("run_dir"),
+            "parser": runner_result.get("parser"),
+            "chunking_strategy": runner_result.get("chunking_strategy"),
+            "embedding_model": runner_result.get("embedding_model"),
+            "use_existing_index": runner_result.get("use_existing_index"),
+            "source_index": runner_result.get("source_index"),
+            "reports": runner_result.get("reports"),
+        }
+    )
+    if runner_result.get("warnings"):
+        st.warning("Some extraction or chunking warnings were recorded.")
+        st.write(runner_result.get("warnings"))
+
+    original_results = dict(runner_result.get("original_results", {}))
+    multi_query_results = dict(runner_result.get("multi_query_results", {}))
+    original_records, original_error = read_jsonl(Path(str(original_results.get("retrieval_results", ""))))
+    sub_query_records, sub_query_error = read_jsonl(
+        Path(str(multi_query_results.get("sub_query_retrieval_results", "")))
+    )
+    fused_records, fused_error = read_jsonl(Path(str(multi_query_results.get("fused_retrieval_results", ""))))
+    answer_records, answer_error = read_jsonl(Path(str(multi_query_results.get("answer_results", ""))))
+    for error in [original_error, sub_query_error, fused_error, answer_error]:
+        if error:
+            st.warning(error)
+    if not fused_records:
+        st.info("No multi-query fused retrieval results were found for this run.")
+        return
+
+    answers_by_question = {str(record.get("question_id")): record for record in answer_records}
+    original_by_question = {str(record.get("question_id")): record for record in original_records}
+    question_ids = [str(record.get("question_id")) for record in fused_records]
+    question_text_by_id = {
+        str(record.get("question_id")): str(record.get("question", ""))
+        for record in fused_records
+    }
+    selected_question_id = st.selectbox(
+        "Question",
+        options=question_ids,
+        format_func=lambda question_id: f"{question_id} - {question_text_by_id.get(question_id, '')}",
+        key=f"multi_query_result_question_{runner_result.get('run_id')}",
+    )
+    fused_record = next(
+        record for record in fused_records if str(record.get("question_id")) == selected_question_id
+    )
+    original_record = original_by_question.get(selected_question_id, {})
+    answer_record = answers_by_question.get(selected_question_id, {})
+
+    st.markdown("#### Generated Answer")
+    render_answer_intent(answer_record)
+    st.markdown(str(answer_record.get("generated_answer", "")))
+    render_table_evidence_used(answer_record)
+    render_expanded_context_chunks(answer_record)
+
+    st.markdown("#### Sub-queries")
+    st.write(
+        {
+            "original_query": fused_record.get("original_query", fused_record.get("question", "")),
+            "generated_sub_queries": fused_record.get(
+                "generated_sub_queries",
+                fused_record.get("sub_queries", []),
+            ),
+            "accepted_sub_queries": fused_record.get("accepted_sub_queries", []),
+            "rejected_sub_queries": fused_record.get("rejected_sub_queries", []),
+            "query_anchors": fused_record.get("query_anchors", []),
+            "required_anchors": fused_record.get("required_anchors", []),
+            "query_sources": fused_record.get("query_sources", {}),
+        }
+    )
+
+    columns = st.columns(2)
+    with columns[0]:
+        st.markdown("#### Original Single-query Top-K")
+        render_chunk_table(
+            original_record.get("retrieved_chunks", []),
+            "No original single-query chunks found.",
+        )
+    with columns[1]:
+        st.markdown("#### Multi-query RRF Final Top-K")
+        render_chunk_table(
+            fused_record.get("fused_chunks", []),
+            "No fused multi-query chunks found.",
+        )
+
+    with st.expander("Sub-query Retrieval Debug", expanded=False):
+        question_sub_records = [
+            record for record in sub_query_records if str(record.get("question_id")) == selected_question_id
+        ]
+        rows = []
+        for record in question_sub_records:
+            rows.append(
+                {
+                    "retrieval_query_index": record.get("retrieval_query_index", "N/A"),
+                    "retrieval_query": record.get("retrieval_query", record.get("sub_query", "")),
+                    "retrieval_query_source": record.get("retrieval_query_source", "N/A"),
+                    "retrieved_chunk_count": len(record.get("retrieved_chunks", [])),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        for record in question_sub_records:
+            label = (
+                f"{record.get('retrieval_query_index', 'N/A')}: "
+                f"{record.get('retrieval_query', record.get('sub_query', ''))}"
+            )
+            with st.expander(label, expanded=False):
+                render_chunk_table(
+                    record.get("retrieved_chunks", []),
+                    "No chunks found for this sub-query.",
+                )
+
+
 def render_parser_compare_tab(config: dict[str, Any]) -> None:
     st.subheader("Parser Compare")
     render_experiment_context(
@@ -3704,6 +4086,229 @@ def render_parser_fusion_compare_tab(config: dict[str, Any]) -> None:
             render_parser_fusion_results(dict(st.session_state["last_parser_fusion_result"]))
 
 
+def render_multi_query_retrieval_compare_tab(config: dict[str, Any]) -> None:
+    st.subheader("Controlled Query Expansion Preview")
+    render_experiment_context(
+        variable="query strategy",
+        fixed=[
+            "parser",
+            "chunking_strategy",
+            "embedding_model",
+            "answer_model",
+            "benchmark_questions_path",
+        ],
+    )
+    st.caption(
+        "Previews conservative phrase-level query expansions before retrieval. "
+        "The original query is always included, word-level splitting is disabled, "
+        "and no LLM query expansion is used."
+    )
+
+    embedding_options, answer_options, default_embedding, default_answer, default_top_k = benchmark_defaults(config)
+    index_mode = st.selectbox(
+        "Index mode",
+        options=["Use exist index", "Build new index if missing"],
+        index=0,
+        key="multi_query_index_mode",
+        help="Use exist index is retrieval-only. Build new index if missing allows a fallback build.",
+    )
+    use_existing_index = True
+    build_new_index_if_missing = index_mode == "Build new index if missing"
+    source_index: dict[str, Any] = {}
+    uploaded_pdf = None
+
+    candidates = multi_query_index_candidates()
+    if not candidates:
+        st.warning("No existing index candidates were found under outputs/runs/.")
+    else:
+        selected_label = st.selectbox(
+            "Existing index source",
+            options=[candidate["label"] for candidate in candidates],
+            key="multi_query_source_index",
+        )
+        source_index = next(candidate for candidate in candidates if candidate["label"] == selected_label)
+        st.markdown("#### Source Index")
+        st.write(
+            {
+                "source_run_id": source_index.get("source_run_id"),
+                "uploaded_pdf_path": source_index.get("uploaded_pdf_path"),
+                "parser": source_index.get("parser"),
+                "chunking_strategy": source_index.get("chunking_strategy"),
+                "embedding_model": source_index.get("embedding_model"),
+                "source_chroma_path": source_index.get("source_chroma_path"),
+                "source_chunks_path": source_index.get("source_chunks_path"),
+                "source_collection_name": source_index.get("source_collection_name"),
+            }
+        )
+    parser_id = str(source_index.get("parser", ""))
+    chunking_strategy = str(source_index.get("chunking_strategy", ""))
+    embedding_model = str(source_index.get("embedding_model", default_embedding))
+
+    if build_new_index_if_missing:
+        uploaded_pdf = st.file_uploader(
+            "Fallback PDF upload",
+            type=["pdf"],
+            key="multi_query_pdf",
+            help="Only used if the selected source index files are missing.",
+        )
+    if not source_index and build_new_index_if_missing:
+        parser_label = st.selectbox("Parser", options=PARSER_OPTIONS, key="multi_query_parser")
+        parser_id = PARSER_ID_BY_LABEL[parser_label]
+        chunking_strategy = st.selectbox(
+            "Chunking strategy",
+            options=CHUNKING_STRATEGY_OPTIONS,
+            key="multi_query_chunking",
+        )
+        embedding_model = st.selectbox(
+            "Embedding model",
+            options=embedding_options,
+            index=default_index(embedding_options, default_embedding),
+            key="multi_query_embedding",
+        )
+    table_handling = render_table_handling_options(
+        "multi_query_table",
+        title="Answer Context Options",
+        show_detection_options=False,
+        include_answer_context_options=True,
+    )
+    answer_model = st.selectbox(
+        "Answer model",
+        options=answer_options,
+        index=default_index(answer_options, default_answer),
+        key="multi_query_answer",
+    )
+    per_query_top_k = st.number_input(
+        "per_query_top_k",
+        min_value=1,
+        max_value=100,
+        value=max(default_top_k, 10),
+        step=1,
+        key="multi_query_per_query_top_k",
+    )
+    final_top_k = st.number_input(
+        "final_top_k",
+        min_value=1,
+        max_value=50,
+        value=default_top_k,
+        step=1,
+        key="multi_query_final_top_k",
+    )
+    max_sub_queries = st.number_input(
+        "max_sub_queries",
+        min_value=1,
+        max_value=12,
+        value=5,
+        step=1,
+        key="multi_query_max_sub_queries",
+    )
+    benchmark_questions, benchmark_questions_error = load_benchmark_questions_for_ui()
+    render_benchmark_questions_preview(benchmark_questions, benchmark_questions_error)
+    accepted_sub_queries_by_question: dict[str, list[str]] = {}
+    rejected_sub_queries_by_question: dict[str, list[dict[str, str]]] = {}
+    query_preview_by_question: dict[str, Any] = {}
+    if benchmark_questions and not benchmark_questions_error:
+        (
+            accepted_sub_queries_by_question,
+            rejected_sub_queries_by_question,
+            query_preview_by_question,
+        ) = build_multi_query_preview(
+            benchmark_questions,
+            max_sub_queries=int(max_sub_queries),
+        )
+
+    validation_errors = []
+    if use_existing_index and not source_index and not build_new_index_if_missing:
+        validation_errors.append("Select an existing index source.")
+    if benchmark_questions_error:
+        validation_errors.append(benchmark_questions_error)
+    for question in benchmark_questions:
+        question_id = str(question.get("id", ""))
+        if question_id and not accepted_sub_queries_by_question.get(question_id):
+            validation_errors.append(f"No accepted query phrases for question {question_id}.")
+    for error in validation_errors:
+        st.warning(error)
+
+    rendered_current_results = False
+    if st.button("Run Controlled Query Expansion Retrieval", type="primary", key="run_multi_query"):
+        errors = list(validation_errors)
+        if build_new_index_if_missing and not source_index:
+            errors = validate_setup_inputs(uploaded_pdf, validation_errors)
+        if errors:
+            for error in errors:
+                st.warning(error)
+            return
+
+        run_config = setup_run_config("multi_query_retrieval_compare", int(final_top_k))
+        run_config.update(
+            {
+                "parser": parser_id,
+                "chunking_strategy": chunking_strategy,
+                "retrieval_strategy": "multi_query_rrf",
+                "embedding_model": embedding_model,
+                "answer_model": answer_model,
+                "table_handling": table_handling,
+                "use_existing_index": bool(source_index),
+                "build_new_index_if_missing": bool(build_new_index_if_missing),
+                "source_index": source_index if use_existing_index else {},
+                "per_query_top_k": int(per_query_top_k),
+                "final_top_k": int(final_top_k),
+                "max_sub_queries": int(max_sub_queries),
+                "rrf_k": 60,
+                "query_decomposition": {
+                    "method": "rule_based",
+                    "mode": "controlled_preview",
+                    "always_include_original": True,
+                    "word_level_splitting": False,
+                    "llm_query_expansion": False,
+                    "accepted_sub_queries_by_question": accepted_sub_queries_by_question,
+                    "rejected_sub_queries_by_question": rejected_sub_queries_by_question,
+                    "preview_by_question": query_preview_by_question,
+                },
+                "chunk_size": safe_int(
+                    config.get("chunking", {}).get("chunk_size"),
+                    default=800,
+                ),
+                "chunk_overlap": safe_int(
+                    config.get("chunking", {}).get("chunk_overlap"),
+                    default=150,
+                ),
+            }
+        )
+        if uploaded_pdf is None:
+            run_id, run_dir, config_path = save_config_only_run_config(run_config)
+        else:
+            run_id, run_dir, config_path = save_setup_only_run_config(run_config, uploaded_pdf)
+        render_saved_run(run_id, run_dir, config_path, run_config)
+
+        progress_bar = st.progress(0)
+        with st.status("Running controlled query expansion retrieval", expanded=True) as status:
+            try:
+                from benchmark_runner import run_multi_query_retrieval_compare
+
+                def update_progress(message: str, step: int, total: int) -> None:
+                    progress_bar.progress(step / total)
+                    st.write(message)
+
+                runner_result = run_multi_query_retrieval_compare(
+                    config_path,
+                    progress_callback=update_progress,
+                )
+            except Exception as exc:
+                status.update(label="Controlled query expansion retrieval failed", state="error")
+                st.error(f"Controlled query expansion retrieval failed: {exc}")
+                return
+
+            status.update(label="Controlled query expansion retrieval complete", state="complete")
+
+        st.session_state["last_multi_query_result"] = runner_result
+        render_multi_query_retrieval_results(runner_result)
+        rendered_current_results = True
+
+    if "last_multi_query_result" in st.session_state and not rendered_current_results:
+        with st.expander("Latest Controlled Query Expansion Results", expanded=False):
+            render_multi_query_retrieval_results(dict(st.session_state["last_multi_query_result"]))
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -3727,6 +4332,7 @@ def main() -> None:
         embedding_tab,
         retrieval_fusion_tab,
         parser_fusion_tab,
+        multi_query_tab,
         best_profile_tab,
     ) = st.tabs(
         [
@@ -3735,6 +4341,7 @@ def main() -> None:
             "Embedding Compare",
             "Retrieval Fusion Compare",
             "Parser Fusion Compare",
+            "Controlled Query Expansion Preview",
             "Best Profile Manager",
         ]
     )
@@ -3753,6 +4360,9 @@ def main() -> None:
 
     with parser_fusion_tab:
         render_parser_fusion_compare_tab(config)
+
+    with multi_query_tab:
+        render_multi_query_retrieval_compare_tab(config)
 
     with best_profile_tab:
         render_best_profile_manager_tab()

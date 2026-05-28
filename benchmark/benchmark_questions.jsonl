@@ -1,5 +1,3 @@
 {"id": "q001", "question": "Explain format NVM behavior and it's secure erase options in detail."}
-{"id": "q002", "question": "Explain admin command behavior and it's opcode."}
-{"id": "q003", "question": "Explain submission queue and completion queue behavior."}
-{"id": "q004", "question": "Compare format NVM and Sanitize behavior."}
-{"id": "q005", "question": "Explain all of the NVMe reset types and it's behavior."}
+{"id": "q002", "question": "Sanitize operations."}
+{"id": "q003", "question": "Sanitize capabilities."}
