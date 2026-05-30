@@ -40,6 +40,9 @@ TABLE_METADATA_KEYS = [
     "table_markdown",
     "full_table_markdown",
     "parent_table_text",
+    "parent_table_title",
+    "field_name",
+    "field_aliases",
     "table_value_codes",
     "nearby_context",
     "caption",
@@ -233,7 +236,7 @@ def chunk_metadata(chunk: dict[str, Any], parser_id: str) -> dict[str, str | int
         "source_parser": str(chunk.get("source_parser") or parser_id),
     }
 
-    if "page_number" in chunk:
+    if chunk.get("page_number") not in (None, ""):
         metadata["page_number"] = int(chunk["page_number"])
     if chunk.get("section_title"):
         metadata["section_title"] = str(chunk["section_title"])
@@ -462,11 +465,12 @@ def index_chunks(
     parser_id: str,
 ) -> None:
     for batch in batch_records(chunks, BATCH_SIZE):
+        documents = [str(chunk.get("text_for_embedding") or chunk["text"]) for chunk in batch]
         collection.upsert(
             ids=[str(chunk["chunk_id"]) for chunk in batch],
-            documents=[str(chunk["text"]) for chunk in batch],
+            documents=documents,
             metadatas=[chunk_metadata(chunk, parser_id) for chunk in batch],
-            embeddings=embedding_model.embed_texts([str(chunk["text"]) for chunk in batch]),
+            embeddings=embedding_model.embed_texts(documents),
         )
 
 
@@ -1127,7 +1131,7 @@ def effective_chunk_type(chunk: dict[str, Any], table_handling: dict[str, bool])
     if not isinstance(chunk, dict):
         return "text"
     chunk_type = str(chunk.get("chunk_type") or chunk.get("content_type") or "").casefold()
-    if chunk_type in {"table", "table_fragment", "possible_table"}:
+    if chunk_type in {"table", "table_fragment", "possible_table", "table_field"}:
         return chunk_type
     if table_handling["detect_tables"] and is_possible_table_text(str(chunk.get("text", ""))):
         return "possible_table"
@@ -1216,6 +1220,28 @@ def related_table_chunks(
     return [], ""
 
 
+def parent_table_chunks_for_field(
+    chunk: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    table_handling: dict[str, bool],
+) -> list[dict[str, Any]]:
+    parent_id = str(chunk.get("parent_table_id") or chunk.get("table_id") or "")
+    if not parent_id:
+        return []
+    same_parent = [
+        candidate
+        for candidate in chunks
+        if isinstance(candidate, dict)
+        and str(candidate.get("parent_table_id") or candidate.get("table_id") or "") == parent_id
+    ]
+    parent_tables = [
+        candidate
+        for candidate in same_parent
+        if effective_chunk_type(candidate, table_handling) in {"table", "table_fragment"}
+    ]
+    return sorted_chunks(parent_tables or same_parent)
+
+
 def expanded_context_record(
     chunk: dict[str, Any],
     expanded_from_chunk_id: str,
@@ -1230,6 +1256,9 @@ def expanded_context_record(
         "chunk_type": chunk.get("chunk_type", ""),
         "table_id": chunk.get("table_id", ""),
         "parent_table_id": chunk.get("parent_table_id", ""),
+        "parent_table_title": chunk.get("parent_table_title", ""),
+        "field_name": chunk.get("field_name", ""),
+        "field_aliases": chunk.get("field_aliases", ""),
         "page_number": chunk.get("page_number", ""),
         "section_title": chunk.get("section_title", ""),
         "source_parser": source_parser_for_chunk(chunk),
@@ -1271,6 +1300,22 @@ def prepare_answer_context_chunks(
         chunk = merge_chunk_with_corpus(retrieved_chunk, corpus_by_id)
         chunk_type = effective_chunk_type(chunk, handling)
         search_pool = corpus_chunks or [merge_chunk_with_corpus(item, corpus_by_id) for item in input_chunks]
+        if chunk_type == "table_field":
+            add_context_chunk(chunk)
+            parent_chunks = parent_table_chunks_for_field(chunk, search_pool, handling)
+            expanded_from = str(chunk.get("chunk_id") or "")
+            for parent_chunk in parent_chunks:
+                parent_id = str(parent_chunk.get("chunk_id") or "")
+                if parent_id and parent_id != expanded_from and parent_id not in retrieved_chunk_ids:
+                    expansion_records.append(
+                        expanded_context_record(
+                            parent_chunk,
+                            expanded_from,
+                            "parent_table_from_field",
+                        )
+                    )
+                add_context_chunk(parent_chunk)
+            continue
         related_chunks, reason = related_table_chunks(chunk, search_pool)
 
         has_complete_group_context = len(related_chunks) > 1 or any(
@@ -1362,6 +1407,12 @@ def answer_context_text(chunk: dict[str, Any], table_handling: dict[str, bool]) 
         parts.append(f"Section: {chunk['section_title']}")
     if chunk.get("caption"):
         parts.append(f"Caption: {chunk['caption']}")
+    if chunk.get("parent_table_title"):
+        parts.append(f"Parent table title: {chunk['parent_table_title']}")
+    if chunk.get("field_name"):
+        parts.append(f"Field name: {chunk['field_name']}")
+    if chunk.get("field_aliases"):
+        parts.append(f"Field aliases: {chunk['field_aliases']}")
     if chunk.get("retrieval_query"):
         parts.append(
             "Retrieval query metadata:\n"
@@ -1376,7 +1427,18 @@ def answer_context_text(chunk: dict[str, Any], table_handling: dict[str, bool]) 
             f"- retrieval_query_sources: {json.dumps(chunk.get('retrieval_query_sources', {}), ensure_ascii=False)}"
         )
 
-    if chunk_type in {"table", "table_fragment"}:
+    if chunk_type == "table_field":
+        if table_handling["include_nearby_context"] and chunk.get("nearby_context"):
+            parts.append(f"Nearby context:\n{chunk['nearby_context']}")
+        parts.append(f"Table field evidence:\n{chunk.get('text', '')}")
+        if table_handling["include_full_table_context"] and (
+            chunk.get("full_table_markdown") or chunk.get("table_markdown") or chunk.get("parent_table_text")
+        ):
+            parts.append(
+                "Linked parent table context:\n"
+                f"{chunk.get('full_table_markdown') or chunk.get('table_markdown') or chunk.get('parent_table_text')}"
+            )
+    elif chunk_type in {"table", "table_fragment"}:
         if table_handling["include_nearby_context"] and chunk.get("nearby_context"):
             parts.append(f"Nearby context:\n{chunk['nearby_context']}")
         if table_handling["include_table_json"] and chunk.get("table_json"):
@@ -1440,7 +1502,7 @@ def table_evidence_used(
             continue
         chunk_id = str(chunk.get("chunk_id") or "")
         chunk_type = effective_chunk_type(chunk, handling)
-        if chunk_type not in {"table", "table_fragment", "possible_table"}:
+        if chunk_type not in {"table", "table_fragment", "possible_table", "table_field"}:
             continue
         key = chunk_id or str(id(chunk))
         if key in seen_evidence:
@@ -1457,6 +1519,9 @@ def table_evidence_used(
             "chunk_type": chunk_type,
             "table_id": chunk.get("table_id", ""),
             "parent_table_id": chunk.get("parent_table_id", ""),
+            "parent_table_title": chunk.get("parent_table_title", ""),
+            "field_name": chunk.get("field_name", ""),
+            "field_aliases": chunk.get("field_aliases", ""),
             "page_number": chunk.get("page_number", ""),
             "section_title": chunk.get("section_title", ""),
             "source_parser": source_parser_for_chunk(chunk),
@@ -1539,6 +1604,7 @@ Rules:
 - The final answer must answer the original user question, not the decomposed query individually.
 - Ignore evidence that is not relevant to the original question.
 - Pay special attention to table evidence.
+- Table field chunks are searchable child rows from a larger parent table. Use the field row together with linked parent table context.
 - Some retrieved chunks may introduce a table that appears in nearby or following context. If expanded table context is provided, use it together with the retrieved explanatory text.
 - If a query asks about operations, capabilities, values, fields, or bits, check table evidence carefully.
 - Some table evidence may be split across multiple chunks.
@@ -1580,6 +1646,7 @@ Rules:
 - The final answer must answer the original user question, not the decomposed query individually.
 - Ignore evidence that is not relevant to the original question.
 - Pay special attention to table evidence.
+- Table field chunks are searchable child rows from a larger parent table. Use the field row together with linked parent table context.
 - Some retrieved chunks may introduce a table that appears in nearby or following context. If expanded table context is provided, use it together with the retrieved explanatory text.
 - If a query asks about operations, capabilities, values, fields, or bits, check table evidence carefully.
 - Some table evidence may be split across multiple chunks.
@@ -1939,8 +2006,7 @@ def create_chunks_for_strategy(
         assign_table_group_ids(chunks)
         if chunking_strategy == "parent-child table context":
             warnings.append(
-                "parent-child table context currently stores table nearby_context metadata when available; "
-                "hierarchical child-to-parent retrieval is not implemented yet."
+                "parent-child table context creates field-level table child chunks when markdown table rows are available."
             )
         return chunks, warnings
 

@@ -26,6 +26,9 @@ TABLE_METADATA_KEYS = [
     "table_markdown",
     "full_table_markdown",
     "parent_table_text",
+    "parent_table_title",
+    "field_name",
+    "field_aliases",
     "table_value_codes",
     "nearby_context",
     "caption",
@@ -118,12 +121,13 @@ def pymupdf_chunk_metadata(chunk: dict[str, Any]) -> dict[str, str | int]:
     metadata: dict[str, str | int] = {
         "chunk_id": str(chunk["chunk_id"]),
         "document_name": str(chunk["document_name"]),
-        "page_number": int(chunk["page_number"]),
         "chunk_index": int(chunk["chunk_index"]),
         "char_count": int(chunk["char_count"]),
         "chunk_type": str(chunk.get("chunk_type") or classify_chunk_text(str(chunk.get("text", "")))),
         "source_parser": str(chunk.get("source_parser") or "pymupdf"),
     }
+    if chunk.get("page_number") not in (None, ""):
+        metadata["page_number"] = int(chunk["page_number"])
     for key in TABLE_METADATA_KEYS:
         value = chunk.get(key)
         if key in metadata or value in (None, ""):
@@ -173,7 +177,7 @@ def index_chunks(
 ) -> None:
     for batch in batch_records(chunks, batch_size):
         ids = [str(chunk["chunk_id"]) for chunk in batch]
-        documents = [str(chunk["text"]) for chunk in batch]
+        documents = [str(chunk.get("text_for_embedding") or chunk["text"]) for chunk in batch]
         metadatas = [chunk_metadata(chunk, source) for chunk in batch]
         embeddings = embedding_model.embed_texts(documents)
 

@@ -73,6 +73,23 @@ TABLE_AWARE_CHUNKING_STRATEGY_OPTIONS = [
     "table-aware",
     "parent-child table context",
 ]
+TABLE_METADATA_KEYS = [
+    "chunk_type",
+    "table_id",
+    "parent_table_id",
+    "parent_table_title",
+    "field_name",
+    "field_aliases",
+    "table_group_index",
+    "table_fragment_index",
+    "table_markdown",
+    "full_table_markdown",
+    "parent_table_text",
+    "table_value_codes",
+    "nearby_context",
+    "caption",
+    "source_parser",
+]
 DEFAULT_RETRIEVAL_STRATEGY = "dense_vector"
 
 
@@ -488,6 +505,10 @@ def format_retrieved_chunks(query_result: dict[str, Any]) -> list[dict[str, Any]
 
         if distances:
             chunk["distance"] = distances[index]
+        for key in TABLE_METADATA_KEYS:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                chunk[key] = value
 
         retrieved_chunks.append(chunk)
 
@@ -952,6 +973,8 @@ def get_chunk_type_label(chunk: dict[str, Any]) -> str:
         return "[Table Chunk]"
     if chunk_type == "table_fragment":
         return "[Table Fragment]"
+    if chunk_type == "table_field":
+        return "[Table Field Chunk]"
     if chunk.get("contains_table") is True or is_possible_table_chunk(chunk.get("text", "")):
         return "[Possible Table Chunk]"
     return "[Text Chunk]"
@@ -969,7 +992,7 @@ def count_table_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
 
     for chunk in chunks:
         label = table_chunk_label(chunk)
-        if label in {"[Table Chunk]", "[Table Fragment]"}:
+        if label in {"[Table Chunk]", "[Table Fragment]", "[Table Field Chunk]"}:
             table_chunks += 1
         elif label == "[Possible Table Chunk]":
             possible_table_chunks += 1
@@ -1008,7 +1031,12 @@ def table_like_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         chunk
         for chunk in chunks
-        if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]", "[Possible Table Chunk]"}
+        if table_chunk_label(chunk) in {
+            "[Table Chunk]",
+            "[Table Fragment]",
+            "[Possible Table Chunk]",
+            "[Table Field Chunk]",
+        }
     ]
 
 
@@ -1031,7 +1059,7 @@ def summarize_table_evidence(chunks: list[dict[str, Any]]) -> dict[str, Any]:
     confirmed = [
         chunk
         for chunk in chunks
-        if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]"}
+        if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]", "[Table Field Chunk]"}
     ]
     possible = [chunk for chunk in chunks if table_chunk_label(chunk) == "[Possible Table Chunk]"]
     evidence_chunks = confirmed + possible
@@ -1898,6 +1926,8 @@ def parser_fusion_chunk_rows(chunks: list[dict[str, Any]], fused: bool = False) 
                     "parser_sources": display_value(first_present(chunk, ["parser_sources"], [])),
                     "page_number": first_present(chunk, ["page_number"]),
                     "section_title": first_present(chunk, ["section_title"]),
+                    "field_name": first_present(chunk, ["field_name"]),
+                    "parent_table_title": first_present(chunk, ["parent_table_title"]),
                     "fusion_score": first_present(chunk, ["fusion_score", "score", "distance", "similarity"]),
                     "text_preview": preview_text(first_present(chunk, ["text"], "")),
                 }
@@ -1909,6 +1939,8 @@ def parser_fusion_chunk_rows(chunks: list[dict[str, Any]], fused: bool = False) 
                     "chunk_id": first_present(chunk, ["chunk_id"]),
                     "page_number": first_present(chunk, ["page_number"]),
                     "section_title": first_present(chunk, ["section_title"]),
+                    "field_name": first_present(chunk, ["field_name"]),
+                    "parent_table_title": first_present(chunk, ["parent_table_title"]),
                     "chunk_index": first_present(chunk, ["chunk_index"]),
                     "score_or_distance": first_present(
                         chunk,
@@ -1926,6 +1958,9 @@ def parser_fusion_chunk_metadata(chunk: dict[str, Any], fused: bool) -> dict[str
         "chunk_id": first_present(chunk, ["chunk_id"]),
         "table_id": first_present(chunk, ["table_id"]),
         "parent_table_id": first_present(chunk, ["parent_table_id"]),
+        "parent_table_title": first_present(chunk, ["parent_table_title"]),
+        "field_name": first_present(chunk, ["field_name"]),
+        "field_aliases": display_value(first_present(chunk, ["field_aliases"], [])),
         "table_group_index": first_present(chunk, ["table_group_index"]),
         "table_fragment_index": first_present(chunk, ["table_fragment_index"]),
         "table_value_codes": display_value(first_present(chunk, ["table_value_codes"], [])),
@@ -1975,6 +2010,18 @@ def render_table_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
         table_json = chunk.get("table_json") or chunk.get("raw_table_json")
         text = str(chunk.get("text") or "")
 
+        if label == "[Table Field Chunk]":
+            st.markdown("##### Table Field")
+            st.write(
+                {
+                    "field_name": chunk.get("field_name", "N/A"),
+                    "field_aliases": chunk.get("field_aliases", "N/A"),
+                    "parent_table_title": chunk.get("parent_table_title", "N/A"),
+                    "parent_table_id": chunk.get("parent_table_id", "N/A"),
+                }
+            )
+            st.markdown("##### Field Text")
+            st.write(preview_text(text, limit=1200))
         if parent_table_context:
             st.markdown("##### Full Parent Table Context")
             st.code(str(parent_table_context), language="markdown")
@@ -2113,6 +2160,9 @@ def render_expanded_context_chunks(answer_record: dict[str, Any] | None) -> None
                 "context_expansion_reason": record.get("context_expansion_reason", "N/A"),
                 "table_id": record.get("table_id", "N/A"),
                 "parent_table_id": record.get("parent_table_id", "N/A"),
+                "parent_table_title": record.get("parent_table_title", "N/A"),
+                "field_name": record.get("field_name", "N/A"),
+                "field_aliases": display_value(record.get("field_aliases", "")),
                 "page_number": record.get("page_number", "N/A"),
                 "section_title": record.get("section_title", "N/A"),
                 "source_parser": record.get("source_parser", "N/A"),
@@ -2170,7 +2220,12 @@ def render_text_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
 
 
 def render_chunk_card(chunk: dict[str, Any], fused: bool = False) -> None:
-    if table_chunk_label(chunk) in {"[Table Chunk]", "[Table Fragment]", "[Possible Table Chunk]"}:
+    if table_chunk_label(chunk) in {
+        "[Table Chunk]",
+        "[Table Fragment]",
+        "[Possible Table Chunk]",
+        "[Table Field Chunk]",
+    }:
         render_table_chunk_card(chunk, fused=fused)
     else:
         render_text_chunk_card(chunk, fused=fused)

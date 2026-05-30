@@ -8,6 +8,19 @@ TABLE_SEPARATOR_PATTERN = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)
 PIPE_ROW_PATTERN = re.compile(r"^\s*\|.*\|\s*$")
 TABLE_TERMS = ["Value", "Description", "Bit", "Bits", "Field", "Fields", "Reserved"]
 VALUE_CODE_PATTERN = re.compile(r"\b(?:[01]{2,8}b|[0-9A-Fa-f]{2,8}h|\d{1,2}:\d{1,2})\b")
+FIELD_ALIAS_MAP = {
+    "sanitize capabilities": [
+        "SANCAP",
+        "Sanitize Capabilities",
+        "sanitize operation capabilities",
+        "Identify Controller Sanitize Capabilities",
+    ],
+    "secure erase settings": [
+        "SES",
+        "Secure Erase Settings",
+        "Format NVM Secure Erase Settings",
+    ],
+}
 
 
 def is_markdown_table(text: str) -> bool:
@@ -124,7 +137,7 @@ def is_table_like_chunk(chunk: dict[str, Any]) -> bool:
     if not isinstance(chunk, dict):
         return False
     chunk_type = str(chunk.get("chunk_type") or "").casefold()
-    if chunk_type in {"table", "table_fragment", "possible_table"}:
+    if chunk_type in {"table", "table_fragment", "possible_table", "table_field"}:
         return True
     return is_possible_table_text(str(chunk.get("text", "")))
 
@@ -236,7 +249,8 @@ def assign_table_group_ids(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]
                 chunk["parent_table_id"] = group_id
             chunk["table_group_index"] = group_index
             chunk["table_fragment_index"] = fragment_index
-            if len(group) > 1 and str(chunk.get("chunk_type") or "").casefold() != "table":
+            existing_type = str(chunk.get("chunk_type") or "").casefold()
+            if len(group) > 1 and existing_type not in {"table", "table_field"}:
                 chunk["chunk_type"] = "table_fragment"
             elif not chunk.get("chunk_type"):
                 chunk["chunk_type"] = classify_chunk_text(str(chunk.get("text", "")))
@@ -288,3 +302,130 @@ def add_table_metadata(
         chunk["caption"] = caption
 
     return chunk
+
+
+def split_markdown_row(row: str) -> list[str]:
+    value = str(row or "").strip()
+    if value.startswith("|"):
+        value = value[1:]
+    if value.endswith("|"):
+        value = value[:-1]
+    return [cell.strip().replace("<br>", " ") for cell in value.split("|")]
+
+
+def markdown_table_rows(table_markdown: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in str(table_markdown or "").splitlines():
+        if not PIPE_ROW_PATTERN.match(line):
+            continue
+        if TABLE_SEPARATOR_PATTERN.match(line):
+            continue
+        cells = split_markdown_row(line)
+        if any(cell for cell in cells):
+            rows.append(cells)
+    return rows
+
+
+def field_aliases_for_name(field_name: str) -> list[str]:
+    normalized = str(field_name or "").casefold()
+    aliases: list[str] = []
+    for key, values in FIELD_ALIAS_MAP.items():
+        if key in normalized or any(str(alias).casefold() in normalized for alias in values):
+            aliases.extend(values)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for alias in aliases:
+        key = str(alias).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(str(alias))
+    return unique
+
+
+def canonical_field_name(row_text: str, cells: list[str]) -> str:
+    normalized = str(row_text or "").casefold()
+    if "sanitize capabilities" in normalized or "sancap" in normalized:
+        return "Sanitize Capabilities"
+    if "secure erase settings" in normalized or re.search(r"\bSES\b", row_text):
+        return "Secure Erase Settings"
+    for cell in cells:
+        candidate = re.sub(r"\s+", " ", str(cell or "")).strip()
+        if not candidate:
+            continue
+        if re.fullmatch(r"[0-9A-Fa-f:]+h?|[01]{2,8}b|\d+:\d+", candidate):
+            continue
+        if len(candidate) > 120:
+            continue
+        if re.search(r"[A-Za-z][A-Za-z ]{2,}", candidate):
+            return candidate
+    return re.sub(r"\s+", " ", str(row_text or "")).strip()[:120]
+
+
+def meaningful_table_field_row(row_text: str, cells: list[str]) -> bool:
+    normalized = str(row_text or "").casefold()
+    if any(key in normalized for key in FIELD_ALIAS_MAP):
+        return True
+    if re.search(r"\b(?:SANCAP|SES)\b", row_text):
+        return True
+    alpha_cells = [cell for cell in cells if re.search(r"[A-Za-z]{3,}", cell)]
+    if len(alpha_cells) >= 2 and len(row_text.strip()) >= 24:
+        return True
+    return False
+
+
+def create_table_field_chunks(
+    *,
+    parent_chunk: dict[str, Any],
+    table_markdown: str,
+    parent_table_id: str,
+    parent_table_title: str,
+    source_parser: str,
+    start_chunk_index: int,
+) -> list[dict[str, Any]]:
+    rows = markdown_table_rows(table_markdown)
+    if len(rows) < 2:
+        return []
+    field_chunks: list[dict[str, Any]] = []
+    header = rows[0]
+    for row_index, cells in enumerate(rows[1:]):
+        row_text = " | ".join(cell for cell in cells if cell).strip()
+        if not meaningful_table_field_row(row_text, cells):
+            continue
+        field_name = canonical_field_name(row_text, cells)
+        aliases = field_aliases_for_name(field_name + " " + row_text)
+        text_for_embedding = "\n".join(
+            part
+            for part in [
+                parent_table_title,
+                f"Section: {parent_chunk.get('section_title')}" if parent_chunk.get("section_title") else "",
+                f"Field: {field_name}",
+                f"Aliases: {', '.join(aliases)}" if aliases else "",
+                f"Columns: {' | '.join(header)}" if header else "",
+                f"Row: {row_text}",
+                str(parent_chunk.get("nearby_context") or ""),
+            ]
+            if part
+        )
+        chunk = {
+            "chunk_id": f"{parent_chunk['chunk_id']}:f{row_index:04d}",
+            "document_name": parent_chunk.get("document_name", ""),
+            "section_title": parent_chunk.get("section_title", ""),
+            "chunk_index": start_chunk_index + len(field_chunks),
+            "chunk_type": "table_field",
+            "table_id": parent_table_id,
+            "parent_table_id": parent_table_id,
+            "parent_table_title": parent_table_title,
+            "field_name": field_name,
+            "field_aliases": aliases,
+            "text": text_for_embedding,
+            "text_for_embedding": text_for_embedding,
+            "char_count": len(text_for_embedding),
+            "source": parent_chunk.get("source", source_parser),
+            "source_parser": source_parser,
+            "nearby_context": parent_chunk.get("nearby_context", ""),
+            "table_markdown": table_markdown,
+        }
+        if parent_chunk.get("page_number") not in (None, ""):
+            chunk["page_number"] = parent_chunk.get("page_number")
+        field_chunks.append(chunk)
+    return field_chunks

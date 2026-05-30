@@ -7,7 +7,12 @@ from typing import Any
 
 import yaml
 
-from table_aware import add_table_metadata, assign_table_group_ids, extract_markdown_table_blocks
+from table_aware import (
+    add_table_metadata,
+    assign_table_group_ids,
+    create_table_field_chunks,
+    extract_markdown_table_blocks,
+)
 
 
 DEFAULT_CONFIG_PATH = Path("configs/config.yaml")
@@ -183,8 +188,20 @@ def create_chunks(
                 nearby_context=nearby_context,
                 caption=str(caption) if caption else None,
             )
+            parent_table_title = str(caption or section_title or "Table")
+            chunk["parent_table_title"] = parent_table_title
             chunks.append(chunk)
             offset += 1
+            field_chunks = create_table_field_chunks(
+                parent_chunk=chunk,
+                table_markdown=table_markdown,
+                parent_table_id=f"{document_name}:docling:r{record_index:04d}:t{table_offset:04d}",
+                parent_table_title=parent_table_title,
+                source_parser="docling",
+                start_chunk_index=chunk_start_index + offset,
+            )
+            chunks.extend(field_chunks)
+            offset += len(field_chunks)
 
         per_document_chunk_counts[document_name] = chunk_start_index + offset
 
